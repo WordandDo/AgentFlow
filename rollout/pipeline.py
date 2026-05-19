@@ -218,6 +218,29 @@ class RolloutPipeline:
                     json.dump(evaluation, f, indent=2, ensure_ascii=False)
                 print(f"   Evaluation saved to: {self.eval_file}")
 
+                # Score sidecar: keep results_*.jsonl append-only (Phase 3
+                # resume needs that) but emit a parallel scores file so
+                # callers can sort/filter by score without joining JSON
+                # structures. `evaluator.evaluate` has already written
+                # `result.score` back, so this is just a projection.
+                if self.config.save_results:
+                    scores_file = self.results_file
+                    if scores_file.endswith(".jsonl"):
+                        scores_file = scores_file[:-len(".jsonl")] + ".scores.jsonl"
+                    else:
+                        scores_file = scores_file + ".scores.jsonl"
+                    try:
+                        with open(scores_file, "w", encoding="utf-8") as f:
+                            for r in self.results:
+                                f.write(json.dumps({
+                                    "task_id": r.task_id,
+                                    "success": r.success,
+                                    "score": r.score,
+                                }, ensure_ascii=False) + "\n")
+                        print(f"   Scores written: {scores_file}")
+                    except OSError as e:
+                        log.warning("could not write scores sidecar %s: %r", scores_file, e)
+
             # Calculate summary
             total_time = time.time() - start_time
             successful = sum(1 for r in self.results if r.success)

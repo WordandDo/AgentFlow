@@ -79,7 +79,9 @@ class Evaluator:
         
         for result in results:
             if not result.success:
-                # Failed tasks get score 0
+                # Failed tasks get score 0 (and remember it on the TaskResult
+                # so downstream code can sort / filter without joining the
+                # separate evaluation file).
                 eval_result = EvaluationResult(
                     task_id=result.task_id,
                     predicted=result.predicted_answer,
@@ -88,8 +90,13 @@ class Evaluator:
                     metric=self.metric,
                     details={"error": result.error}
                 )
+                result.score = 0.0
             elif result.ground_truth is None:
-                # No ground truth available
+                # No ground truth available. Keep evaluation summary
+                # consistent with previous behaviour (score=0.0 contributes
+                # to "not evaluated"), but on the TaskResult itself leave
+                # `score=None` so callers can distinguish "no GT" from a
+                # genuine zero.
                 eval_result = EvaluationResult(
                     task_id=result.task_id,
                     predicted=result.predicted_answer,
@@ -98,6 +105,7 @@ class Evaluator:
                     metric=self.metric,
                     details={"note": "No ground truth available"}
                 )
+                result.score = None
             else:
                 # Evaluate prediction
                 # Get evidence from metadata if available (for DocBench)
@@ -119,6 +127,7 @@ class Evaluator:
                     metric=self.metric,
                     details=details
                 )
+                result.score = score
                 scores.append(score)
             
             evaluations.append(eval_result)
