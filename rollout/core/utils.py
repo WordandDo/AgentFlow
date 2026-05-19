@@ -189,30 +189,49 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
 
 def extract_final_answer(text: str) -> str:
-    """Extract final answer from assistant response"""
+    """Extract the final answer from an assistant response.
+
+    Phase 0+ / commit 0.7d (ENG-30): pick the *last* match of each
+    answer pattern rather than the first. Models often emit a
+    candidate then self-correct (e.g. "the answer is 42. Wait,
+    actually the answer is 43."); the previous "first match" policy
+    returned 42 and cost evaluators real accuracy points.
+
+    Implementation notes:
+    - The capture terminator is ``(?:\\.\\s|\\.\\Z|\\n|$)`` so the
+      regex splits on sentence boundaries (period+whitespace or
+      period-at-end) but does NOT split inside numeric answers like
+      ``3.14`` (no whitespace after the dot).
+    - The strong "**Answer**:" marker is tried first so an explicit
+      final answer always beats a mid-stream "thus, X" hedge.
+    """
     if not text:
         return ""
-    
-    # Look for common answer patterns
+
+    # Patterns are tried in priority order: the explicit "**Answer**:"
+    # marker beats free-text answer phrases, which in turn beat
+    # connective phrases like "therefore X". Within each pattern the
+    # LAST match wins (the model's final word on the matter).
+    sentence_end = r"(?:\.\s|\.\Z|\n|$)"
     patterns = [
-        r"(?:final answer|answer is|the answer is|answer:)\s*[:\-]?\s*(.+?)(?:\n|$)",
-        r"(?:therefore|thus|so|hence),?\s+(?:the answer is\s+)?(.+?)(?:\.|$)",
-        r"\*\*Answer\*\*:?\s*(.+?)(?:\n|$)",
+        r"\*\*Answer\*\*:?\s*(.+?)" + sentence_end,
+        r"(?:final answer|the answer is|answer is|answer:)\s*[:\-]?\s*(.+?)" + sentence_end,
+        r"(?:therefore|thus|so|hence),?\s+(?:the answer is\s+)?(.+?)" + sentence_end,
     ]
-    
+
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            answer = match.group(1).strip()
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            answer = matches[-1].strip()
             # Clean up common suffixes
             answer = re.sub(r'\s*\.$', '', answer)
             return answer
-    
+
     # If no pattern matched, return the last non-empty line (often the answer)
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     if lines:
         return lines[-1]
-    
+
     return text.strip()
 
 
