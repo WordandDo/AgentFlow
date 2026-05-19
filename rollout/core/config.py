@@ -80,6 +80,16 @@ class RolloutConfig:
     log_level: str = "INFO"  # Root log level for the structured handler
     shutdown_timeout: float = 30.0  # Total cleanup budget on graceful shutdown
 
+    # Per-worker log file output (Phase 2 / commit 2.3). When
+    # `per_worker_log` is True, each worker attaches its own rotating
+    # file handler under `<log_dir>/<run_id>/rollout.worker.<wid>.log`.
+    # `log_dir` is None by default, which resolves to "<output_dir>/logs"
+    # at runtime so users do not need to set it explicitly.
+    per_worker_log: bool = False
+    log_dir: Optional[str] = None
+    log_max_bytes: int = 100 * 1024 * 1024  # 100 MB per worker file
+    log_backup_count: int = 3
+
     # Benchmark data hygiene. Downstream stages (results, evaluation,
     # checkpoint, resume) all join on `task_id`, so duplicates silently
     # overwrite each other. Default fails fast; teams with legacy data
@@ -240,6 +250,10 @@ class RolloutConfig:
             "save_summary": self.save_summary,
             "log_level": self.log_level,
             "shutdown_timeout": self.shutdown_timeout,
+            "per_worker_log": self.per_worker_log,
+            "log_dir": self.log_dir,
+            "log_max_bytes": self.log_max_bytes,
+            "log_backup_count": self.log_backup_count,
             "task_max_seconds": self.task_max_seconds,
             "llm_timeout": self.llm_timeout,
             "llm_connect_timeout": self.llm_connect_timeout,
@@ -382,6 +396,10 @@ class RolloutConfig:
             errors.append("sandbox_retry_backoff_base must be >= 0")
         if self.sandbox_retry_jitter < 0:
             errors.append("sandbox_retry_jitter must be >= 0")
+        if self.log_max_bytes <= 0:
+            errors.append("log_max_bytes must be positive")
+        if self.log_backup_count < 0:
+            errors.append("log_backup_count must be >= 0")
         # Evaluator needs the in-memory list until the Phase 5 disk reader
         # lands; reject the dangerous combination loudly rather than
         # silently producing an evaluation of zero results.

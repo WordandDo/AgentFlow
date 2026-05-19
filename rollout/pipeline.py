@@ -35,6 +35,7 @@ from .core import (
 from .core.runner import AgentRunner
 from .core.logging_utils import (
     install_root_handler, get_logger, set_context, clear_context, Progress,
+    attach_worker_file_handler, detach_handler,
 )
 from .core.shutdown import ShutdownManager
 
@@ -449,6 +450,30 @@ class RolloutPipeline:
         worker_id = f"rollout_{self.run_id}_w{idx:03d}"
         ctx_tokens = set_context(worker_id=worker_id)
 
+        # Optional per-worker log file (Phase 2 / commit 2.3). Keeps the
+        # stderr handler installed by `install_root_handler` plus a
+        # rotating file specific to this worker; the filter on the file
+        # handler restricts it to records emitted under this worker's
+        # `set_context(worker_id=...)`, so 100 worker files stay
+        # individually greppable. Failure to create the file is logged
+        # at WARNING and never blocks the run.
+        worker_log_handler = None
+        if self.config.per_worker_log:
+            try:
+                log_dir = self._resolve_worker_log_dir()
+                worker_log_handler = attach_worker_file_handler(
+                    worker_id=worker_id,
+                    log_dir=log_dir,
+                    level=self.config.log_level,
+                    max_bytes=self.config.log_max_bytes,
+                    backup_count=self.config.log_backup_count,
+                )
+                log.debug("per-worker log: %s", log_dir)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "could not attach per-worker log for %s: %r", worker_id, e,
+                )
+
         try:
             # Startup jitter: stagger N workers so they do not all call
             # sandbox `create_session` in the same millisecond (ENG-14).
@@ -536,7 +561,16 @@ class RolloutPipeline:
                         "worker %s runner.stop() failed: %r", worker_id, e,
                     )
         finally:
+            if worker_log_handler is not None:
+                detach_handler(worker_log_handler)
             clear_context(ctx_tokens)
+
+    def _resolve_worker_log_dir(self) -> str:
+        """Resolve the per-worker log dir, defaulting to ``<output_dir>/logs/<run_id>``."""
+        base = self.config.log_dir
+        if base:
+            return os.path.join(base, self.run_id)
+        return os.path.join(self.output_dir, "logs", self.run_id)
 
     async def _run_one_with_guard(
         self,

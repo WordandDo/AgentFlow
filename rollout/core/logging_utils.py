@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from contextvars import ContextVar
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, Optional
 
 
@@ -115,6 +117,66 @@ def get_context() -> Dict[str, str]:
     return {name: var.get() for name, var in _CTX_VARS.items()}
 
 
+def attach_worker_file_handler(
+    worker_id: str,
+    log_dir: str,
+    *,
+    level: str = "INFO",
+    max_bytes: int = 100 * 1024 * 1024,
+    backup_count: int = 3,
+) -> logging.Handler:
+    """Attach a rotating per-worker file handler to the root logger.
+
+    The same `_ContextFilter` is installed so each line carries
+    ``run/worker/task/trace`` fields. The handler also filters on
+    ``record.worker_id == worker_id`` so the per-worker file only
+    receives lines emitted from contexts that own that worker (the
+    pool's `set_context(worker_id=...)` already covers that, including
+    nested per-task context).
+
+    Returns the handler so the caller can detach it via
+    :func:`detach_handler` in their `finally` block; without this,
+    long-running processes leak file descriptors.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, f"rollout.worker.{worker_id}.log")
+
+    handler = RotatingFileHandler(
+        path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8",
+    )
+    fmt = (
+        "%(asctime)s [%(levelname)s] %(name)s "
+        "run=%(run_id)s w=%(worker_id)s task=%(task_id)s trace=%(trace_id)s | %(message)s"
+    )
+    handler.setFormatter(logging.Formatter(fmt))
+    handler.addFilter(_ContextFilter())
+
+    # Restrict this handler to records that belong to this worker, so
+    # the per-worker file is grep-clean even though all handlers share
+    # the root logger.
+    def _worker_filter(record: logging.LogRecord, target: str = worker_id) -> bool:
+        return getattr(record, "worker_id", "-") == target
+
+    handler.addFilter(_worker_filter)
+    handler.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+def detach_handler(handler: logging.Handler) -> None:
+    """Remove and close a handler previously attached to the root."""
+    if handler is None:
+        return
+    root = logging.getLogger()
+    try:
+        root.removeHandler(handler)
+    finally:
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
 class Progress:
     """Async-safe wrapper around ``tqdm.asyncio.tqdm``.
 
@@ -153,5 +215,7 @@ __all__ = [
     "set_context",
     "clear_context",
     "get_context",
+    "attach_worker_file_handler",
+    "detach_handler",
     "Progress",
 ]
