@@ -120,6 +120,16 @@ class RolloutConfig:
     resume_file: Optional[str] = None
     resume_retry_failed: bool = True
 
+    # Mid-task checkpoint (Phase 3 / commit 3.3, optional). When True,
+    # the runner snapshots the current `Trajectory` to
+    # `<checkpoint_dir>/<task_id>.json` after each turn so a kill -9
+    # leaves a complete auditable artifact on disk. The pipeline
+    # clears the checkpoint once the task completes (success or
+    # recorded failure). Replay from mid-task is intentionally NOT
+    # implemented yet; this is operator-side artifact recovery only.
+    checkpoint_enabled: bool = False
+    checkpoint_dir: Optional[str] = None  # defaults to <output_dir>/checkpoints/<run_id>
+
     # Three-tier timeouts (Phase 0 / commit 0.5).
     # task: budget for a single benchmark task, including all LLM + tool calls.
     # llm:  budget for a single chat.completion request (per attempt).
@@ -306,6 +316,8 @@ class RolloutConfig:
             "resume": self.resume,
             "resume_file": self.resume_file,
             "resume_retry_failed": self.resume_retry_failed,
+            "checkpoint_enabled": self.checkpoint_enabled,
+            "checkpoint_dir": self.checkpoint_dir,
             # Worker pool (Phase 2 / commit 2.1).
             "concurrency": self.concurrency,
             "worker_startup_jitter": self.worker_startup_jitter,

@@ -16,6 +16,7 @@ import bdb
 from sandbox import Sandbox, format_tool_result
 
 from .config import RolloutConfig
+from .checkpoint_store import CheckpointStore
 from .logging_utils import get_context, get_logger, set_context, clear_context
 
 
@@ -295,16 +296,20 @@ class AgentRunner:
     """
 
     def __init__(self, config: RolloutConfig, worker_id: Optional[str] = None,
-                 run_id: Optional[str] = None):
+                 run_id: Optional[str] = None,
+                 checkpoint_store: Optional[CheckpointStore] = None):
         """Initialize agent runner.
 
         ``run_id`` is the per-pipeline identity used to scope trace ids;
         defaults to a short uuid so isolated invocations still produce
-        unique traces.
+        unique traces. ``checkpoint_store`` (optional, Phase 3 / commit
+        3.3) receives a per-turn `Trajectory.to_dict()` snapshot so a
+        kill -9 mid-task leaves an auditable artifact on disk.
         """
         self.config = config
         self.worker_id = worker_id or f"runner_{int(time.time())}"
         self.run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
+        self.checkpoint_store: Optional[CheckpointStore] = checkpoint_store
 
         # Create the async OpenAI client. We build this in __init__
         # rather than start() so callers can construct the runner from
@@ -742,7 +747,23 @@ class AgentRunner:
                         trajectory.messages.append(tool_msg)
                     finally:
                         clear_context(ctx_tokens)
-                
+
+                # Phase 3 / commit 3.3 (optional): snapshot the
+                # mid-task trajectory after every completed turn so a
+                # kill -9 leaves an auditable artifact on disk. Write
+                # off-loop (worker thread) so disk IO doesn't stall
+                # the event loop at high concurrency. Failures are
+                # swallowed inside `CheckpointStore.write_atomic`.
+                if self.checkpoint_store is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self.checkpoint_store.write_atomic,
+                            trajectory.task_id,
+                            trajectory.to_dict(),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("checkpoint write failed: %r", e)
+
                 turn_count += 1
                 continue
             

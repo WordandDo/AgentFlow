@@ -16,6 +16,7 @@ from .models import (
 )
 from .evaluator import Evaluator, evaluate_results
 from .result_store import ResultStore, ResultStoreLockError
+from .checkpoint_store import CheckpointStore
 from .utils import (
     create_openai_client,
     create_async_openai_client,
@@ -58,6 +59,9 @@ __all__ = [
     # Result store (Phase 3 / commit 3.1)
     "ResultStore",
     "ResultStoreLockError",
+
+    # Mid-task checkpoint (Phase 3 / commit 3.3)
+    "CheckpointStore",
     
     # Utils
     "create_openai_client",

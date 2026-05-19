@@ -31,6 +31,7 @@ from .core import (
     Evaluator,
     ResultStore,
     ResultStoreLockError,
+    CheckpointStore,
     load_benchmark_data,
     get_timestamp
 )
@@ -137,6 +138,10 @@ class RolloutPipeline:
         # Updated by `_record_result` and shown on the progress bar.
         self._stats_ok: int = 0
         self._stats_fail: int = 0
+
+        # Phase 3 / commit 3.3 (optional): mid-task checkpoint store.
+        # Built lazily so disabled runs (the default) pay no cost.
+        self._checkpoint_store: Optional[CheckpointStore] = None
 
     def load_benchmark(self) -> List[BenchmarkItem]:
         """Load benchmark data"""
@@ -296,6 +301,25 @@ class RolloutPipeline:
             # inside a worker thread or notebook).
             log.warning("could not install ShutdownManager: %r", e)
 
+        # Phase 3 / commit 3.3 (optional): build the mid-task
+        # checkpoint store. Default off; opt in via
+        # `config.checkpoint_enabled`. Path defaults to
+        # `<output_dir>/checkpoints/<run_id>` so concurrent runs don't
+        # collide.
+        if self.config.checkpoint_enabled:
+            ckpt_dir = self.config.checkpoint_dir or os.path.join(
+                self.output_dir, "checkpoints", self.run_id
+            )
+            try:
+                self._checkpoint_store = CheckpointStore(ckpt_dir)
+                log.info("checkpoint_enabled=True; writing to %s", ckpt_dir)
+            except OSError as e:
+                log.warning(
+                    "could not initialise checkpoint store at %s: %r; "
+                    "continuing without checkpoints", ckpt_dir, e,
+                )
+                self._checkpoint_store = None
+
         # Phase 3 / commit 3.1: take the cross-process fcntl lock on
         # the results file. For the legacy "timestamp" strategy this
         # is essentially free (the file is fresh per run), but for
@@ -345,7 +369,8 @@ class RolloutPipeline:
                 await self._run_parallel()
             else:
                 runner = AgentRunner(
-                    self.config, worker_id="main_runner", run_id=self.run_id
+                    self.config, worker_id="main_runner", run_id=self.run_id,
+                    checkpoint_store=self._checkpoint_store,
                 )
                 try:
                     print("Starting runner...")
@@ -628,7 +653,10 @@ class RolloutPipeline:
                         batch_idx * float(self.config.worker_startup_batch_interval)
                     )
 
-            runner = AgentRunner(self.config, worker_id=worker_id, run_id=self.run_id)
+            runner = AgentRunner(
+                self.config, worker_id=worker_id, run_id=self.run_id,
+                checkpoint_store=self._checkpoint_store,
+            )
             try:
                 ok = await runner.start()
                 if not ok:
@@ -771,6 +799,11 @@ class RolloutPipeline:
           IO at 100 concurrency;
         - flushes + fsyncs so a hard kill leaves only fully-written lines
           on disk (every reader can JSON-decode every surviving line).
+
+        Phase 3 / commit 3.3: once the result is durably on disk, the
+        mid-task checkpoint (if any) is dropped. Checkpoints are an
+        artifact for KILLED tasks; finished tasks already have the
+        full trajectory in the results jsonl.
         """
         payload = self._build_result_payload(result)
         line = json.dumps(payload, ensure_ascii=False) + "\n"
@@ -780,6 +813,14 @@ class RolloutPipeline:
 
         async with self._save_lock:
             await asyncio.to_thread(self._append_line_sync, line)
+
+        if self._checkpoint_store is not None and result.task_id:
+            try:
+                await asyncio.to_thread(
+                    self._checkpoint_store.clear_completed, result.task_id
+                )
+            except Exception as e:  # noqa: BLE001
+                log.debug("checkpoint clear failed: %r", e)
 
     def _append_line_sync(self, line: str) -> None:
         """Synchronous worker for _save_result; do not call from the loop.
