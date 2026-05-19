@@ -15,6 +15,7 @@ import bdb
 from sandbox import Sandbox, format_tool_result
 
 from .config import RolloutConfig
+from .logging_utils import get_logger
 from .models import (
     BenchmarkItem, Trajectory, Message, ToolCall, TaskResult
 )
@@ -25,6 +26,9 @@ from .utils import (
     convert_tool_schema_to_openai,
     format_tool_result_for_message
 )
+
+
+log = get_logger("rollout.runner")
 
 
 class AgentRunner:
@@ -109,22 +113,56 @@ class AgentRunner:
             return False
 
     async def stop(self) -> None:
-        """Stop the runner and cleanup"""
+        """Cancel-safe stop.
+
+        Even when the outer task is being cancelled (Ctrl+C), best-effort
+        finish: tell the sandbox server to destroy our worker's sessions
+        and close the HTTP client so connections are not leaked. Each
+        step is wrapped in its own ``asyncio.shield + wait_for`` so a
+        misbehaving session cannot block forever and so the cancellation
+        of the enclosing task does not interrupt cleanup mid-flight.
+        """
         try:
             if self.sandbox:
-                # Destroy sessions
                 if self.config.resource_types:
-                    await self.sandbox.destroy_session(self.config.resource_types)
-                
-                # Close sandbox
-                await self.sandbox.close()
+                    try:
+                        await asyncio.shield(
+                            asyncio.wait_for(
+                                self.sandbox.destroy_session(self.config.resource_types),
+                                timeout=10.0,
+                            )
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+                        log.warning(
+                            "destroy_session timed out/cancelled during stop "
+                            "(worker=%s); server TTL will reclaim: %r",
+                            self.worker_id, e,
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "destroy_session failed during stop (worker=%s): %r",
+                            self.worker_id, e,
+                        )
+
+                try:
+                    await asyncio.shield(
+                        asyncio.wait_for(self.sandbox.close(), timeout=5.0)
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+                    log.warning(
+                        "sandbox.close() timed out/cancelled (worker=%s): %r",
+                        self.worker_id, e,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "sandbox.close() failed (worker=%s): %r", self.worker_id, e
+                    )
+
                 self.sandbox = None
-            
+
+        finally:
             self._started = False
-            print(f"[Runner {self.worker_id}] ✅ Stopped")
-            
-        except Exception as e:
-            print(f"[Runner {self.worker_id}] ⚠️ Error during stop: {e}")
+            log.info("runner stopped (worker=%s)", self.worker_id)
 
     async def _load_tool_schemas(self) -> None:
         """Load tool schemas from sandbox or local definitions"""

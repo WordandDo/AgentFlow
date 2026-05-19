@@ -76,6 +76,10 @@ class RolloutConfig:
     trajectory_only: bool = False  # Save only minimal trajectory payload in results
     save_summary: bool = True  # Save summary_<benchmark>_<timestamp>.json
 
+    # Operational knobs (Phase 0)
+    log_level: str = "INFO"  # Root log level for the structured handler
+    shutdown_timeout: float = 30.0  # Total cleanup budget on graceful shutdown
+
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'RolloutConfig':
         """Create configuration from dictionary"""
@@ -153,6 +157,8 @@ class RolloutConfig:
             "save_trajectories": self.save_trajectories,
             "trajectory_only": self.trajectory_only,
             "save_summary": self.save_summary,
+            "log_level": self.log_level,
+            "shutdown_timeout": self.shutdown_timeout,
         }
 
     def to_json(self, json_path: str):
@@ -227,5 +233,12 @@ class RolloutConfig:
         valid_metrics = ["exact_match", "f1_score", "similarity", "contains_answer", "numeric_match", "llm_judgement", "DocBench_LasJ", "MMLongBench-Doc_LasJ", "MMLongBench-Doc_F1", "MMLongBench-Doc_Acc"]
         if self.evaluation_metric not in valid_metrics:
             errors.append(f"evaluation_metric must be one of {valid_metrics}")
+
+        if self.shutdown_timeout <= 0:
+            errors.append("shutdown_timeout must be positive")
+
+        valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        if self.log_level.upper() not in valid_log_levels:
+            errors.append(f"log_level must be one of {sorted(valid_log_levels)}")
 
         return errors

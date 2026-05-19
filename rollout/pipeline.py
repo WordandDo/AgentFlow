@@ -13,6 +13,7 @@ This module provides the main RolloutPipeline class that handles:
 import json
 import os
 import sys
+import uuid
 import asyncio
 import argparse
 from pathlib import Path
@@ -31,6 +32,13 @@ from .core import (
     get_timestamp
 )
 from .core.runner import AgentRunner
+from .core.logging_utils import (
+    install_root_handler, get_logger, set_context, clear_context,
+)
+from .core.shutdown import ShutdownManager
+
+
+log = get_logger("rollout.pipeline")
 
 
 class RolloutPipeline:
@@ -88,6 +96,12 @@ class RolloutPipeline:
         self.results: List[TaskResult] = []
         self.benchmark_items: List[BenchmarkItem] = []
 
+        # Per-run identity + shutdown plumbing (initialised lazily in
+        # run_async so this object remains pickle-friendly).
+        self.run_id = f"run_{uuid.uuid4().hex[:8]}"
+        self._save_lock: Optional[asyncio.Lock] = None
+        self._shutdown: Optional[ShutdownManager] = None
+
     def load_benchmark(self) -> List[BenchmarkItem]:
         """Load benchmark data"""
         if not self.config.data_path:
@@ -117,112 +131,154 @@ class RolloutPipeline:
 
     async def run_async(self) -> RolloutSummary:
         """Run pipeline asynchronously"""
+        install_root_handler(level=getattr(self.config, "log_level", "INFO"))
+        ctx_tokens = set_context(run_id=self.run_id)
         start_time = time.time()
-        
-        # Load benchmark
-        if not self.benchmark_items:
-            self.load_benchmark()
-        
-        print(f"\n{'='*80}")
-        print(f"🚀 Rollout Pipeline")
-        print(f"{'='*80}")
-        print(f"Total tasks: {len(self.benchmark_items)}")
-        print(f"Model: {self.config.model_name}")
-        print(f"Max turns: {self.config.max_turns}")
-        print(f"Parallel: {self.config.parallel}")
-        print(f"{'='*80}\n")
-        
-        # Create runner
-        runner = AgentRunner(self.config, worker_id="main_runner")
-        
+
+        # Per-loop primitives (must be created inside the running loop).
+        self._save_lock = asyncio.Lock()
+        self._shutdown = ShutdownManager()
         try:
-            # Start runner
-            print("Starting runner...")
-            success = await runner.start()
-            if not success:
-                raise RuntimeError("Failed to start runner")
-            
-            # Run tasks
-            if self.config.parallel and self.config.max_workers > 1:
-                await self._run_parallel(runner)
-            else:
-                await self._run_sequential(runner)
-            
-        finally:
-            # Stop runner
-            print("\n🔌 Stopping runner...")
-            await runner.stop()
-        
-        # Evaluate results
-        evaluation = None
-        if self.config.evaluate_results and self.results:
-            print("\n📊 Evaluating results...")
-            evaluator_model_name = self.config.evaluator_model_name or self.config.model_name
-            evaluator_api_key = self.config.evaluator_api_key or self.config.api_key
-            evaluator_base_url = self.config.evaluator_base_url or self.config.base_url
-            evaluator = Evaluator(
-                metric=self.config.evaluation_metric,
-                model_name=evaluator_model_name,
-                api_key=evaluator_api_key,
-                base_url=evaluator_base_url,
-                temperature=self.config.evaluator_temperature,
-                max_retries=self.config.evaluator_max_retries,
-                extra_params=self.config.evaluator_extra_params,
+            self._shutdown.install(asyncio.get_running_loop())
+        except Exception as e:
+            # Non-fatal: continue without signal handling (e.g. when run
+            # inside a worker thread or notebook).
+            log.warning("could not install ShutdownManager: %r", e)
+
+        try:
+            # Load benchmark
+            if not self.benchmark_items:
+                self.load_benchmark()
+
+            print(f"\n{'='*80}")
+            print(f"🚀 Rollout Pipeline (run_id={self.run_id})")
+            print(f"{'='*80}")
+            print(f"Total tasks: {len(self.benchmark_items)}")
+            print(f"Model: {self.config.model_name}")
+            print(f"Max turns: {self.config.max_turns}")
+            print(f"Parallel: {self.config.parallel}")
+            print(f"{'='*80}\n")
+            log.info(
+                "starting rollout: tasks=%d model=%s parallel=%s",
+                len(self.benchmark_items), self.config.model_name, self.config.parallel,
             )
-            evaluation = evaluator.evaluate(self.results)
-            
-            # Save evaluation
-            with open(self.eval_file, 'w', encoding='utf-8') as f:
-                json.dump(evaluation, f, indent=2, ensure_ascii=False)
-            print(f"   Evaluation saved to: {self.eval_file}")
-        
-        # Calculate summary
-        total_time = time.time() - start_time
-        successful = sum(1 for r in self.results if r.success)
-        avg_score = evaluation.get("average_score", 0.0) if evaluation else 0.0
-        
-        summary = RolloutSummary(
-            benchmark_name=self.config.benchmark_name or "benchmark",
-            total_tasks=len(self.results),
-            successful_tasks=successful,
-            failed_tasks=len(self.results) - successful,
-            average_score=avg_score,
-            metric=self.config.evaluation_metric,
-            total_time_seconds=total_time,
-            results_file=self.results_file,
-            evaluation_file=self.eval_file if self.config.evaluate_results else None
-        )
-        
-        # Save summary (optional)
-        if self.config.save_summary:
-            with open(self.summary_file, 'w', encoding='utf-8') as f:
-                json.dump(summary.to_dict(), f, indent=2, ensure_ascii=False)
-        
-        # Print summary
-        print(f"\n\n{'='*80}")
-        print(f"🎉 Rollout Complete!")
-        print(f"{'='*80}")
-        print(f"Total tasks: {summary.total_tasks}")
-        print(f"Successful: {summary.successful_tasks}")
-        print(f"Failed: {summary.failed_tasks}")
-        print(f"Average score: {summary.average_score:.3f}")
-        print(f"Total time: {summary.total_time_seconds:.1f}s")
-        print(f"Results: {self.results_file}")
-        print(f"{'='*80}\n")
-        
-        return summary
+
+            # Create runner
+            runner = AgentRunner(self.config, worker_id="main_runner")
+
+            try:
+                # Start runner
+                print("Starting runner...")
+                success = await runner.start()
+                if not success:
+                    raise RuntimeError("Failed to start runner")
+
+                # Run tasks
+                if self.config.parallel and self.config.max_workers > 1:
+                    await self._run_parallel(runner)
+                else:
+                    await self._run_sequential(runner)
+
+            finally:
+                # Cancel-safe cleanup, bounded by shutdown_timeout.
+                print("\n🔌 Stopping runner...")
+                try:
+                    await asyncio.shield(
+                        asyncio.wait_for(
+                            runner.stop(), timeout=self.config.shutdown_timeout
+                        )
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+                    log.warning(
+                        "runner.stop() did not finish within shutdown_timeout=%ss (%r); "
+                        "server session may be cleaned by TTL",
+                        self.config.shutdown_timeout, e,
+                    )
+
+            # Evaluate results
+            evaluation = None
+            if self.config.evaluate_results and self.results:
+                print("\n📊 Evaluating results...")
+                evaluator_model_name = self.config.evaluator_model_name or self.config.model_name
+                evaluator_api_key = self.config.evaluator_api_key or self.config.api_key
+                evaluator_base_url = self.config.evaluator_base_url or self.config.base_url
+                evaluator = Evaluator(
+                    metric=self.config.evaluation_metric,
+                    model_name=evaluator_model_name,
+                    api_key=evaluator_api_key,
+                    base_url=evaluator_base_url,
+                    temperature=self.config.evaluator_temperature,
+                    max_retries=self.config.evaluator_max_retries,
+                    extra_params=self.config.evaluator_extra_params,
+                )
+                evaluation = evaluator.evaluate(self.results)
+
+                # Save evaluation
+                with open(self.eval_file, 'w', encoding='utf-8') as f:
+                    json.dump(evaluation, f, indent=2, ensure_ascii=False)
+                print(f"   Evaluation saved to: {self.eval_file}")
+
+            # Calculate summary
+            total_time = time.time() - start_time
+            successful = sum(1 for r in self.results if r.success)
+            avg_score = evaluation.get("average_score", 0.0) if evaluation else 0.0
+
+            summary = RolloutSummary(
+                benchmark_name=self.config.benchmark_name or "benchmark",
+                total_tasks=len(self.results),
+                successful_tasks=successful,
+                failed_tasks=len(self.results) - successful,
+                average_score=avg_score,
+                metric=self.config.evaluation_metric,
+                total_time_seconds=total_time,
+                results_file=self.results_file,
+                evaluation_file=self.eval_file if self.config.evaluate_results else None
+            )
+
+            # Save summary (optional)
+            if self.config.save_summary:
+                with open(self.summary_file, 'w', encoding='utf-8') as f:
+                    json.dump(summary.to_dict(), f, indent=2, ensure_ascii=False)
+
+            # Print summary
+            print(f"\n\n{'='*80}")
+            print(f"🎉 Rollout Complete!")
+            print(f"{'='*80}")
+            print(f"Total tasks: {summary.total_tasks}")
+            print(f"Successful: {summary.successful_tasks}")
+            print(f"Failed: {summary.failed_tasks}")
+            print(f"Average score: {summary.average_score:.3f}")
+            print(f"Total time: {summary.total_time_seconds:.1f}s")
+            print(f"Results: {self.results_file}")
+            print(f"{'='*80}\n")
+
+            return summary
+        finally:
+            clear_context(ctx_tokens)
 
     async def _run_sequential(self, runner: AgentRunner) -> None:
-        """Run tasks sequentially"""
+        """Run tasks sequentially.
+
+        Honours ``ShutdownManager``: if a SIGINT/SIGTERM was received we
+        stop pulling new tasks and let the enclosing ``run_async`` reach
+        its ``finally`` block for cancel-safe cleanup.
+        """
         for idx, item in enumerate(self.benchmark_items, 1):
+            if self._shutdown is not None and self._shutdown.triggered:
+                log.warning(
+                    "graceful shutdown requested; stopping after %d/%d tasks",
+                    idx - 1, len(self.benchmark_items),
+                )
+                break
+
             print(f"\n[{idx}/{len(self.benchmark_items)}]", end=" ")
-            
+
             result = await runner.run_task(item)
             self.results.append(result)
-            
-            # Save result immediately
+
+            # Save result immediately (atomic append + fsync, see _save_result).
             if self.config.save_results:
-                self._save_result(result)
+                await self._save_result(result)
 
     async def _run_parallel(self, runner: AgentRunner) -> None:
         """Run tasks in parallel using thread pool"""
@@ -235,20 +291,46 @@ class RolloutPipeline:
         
         await self._run_sequential(runner)
 
-    def _save_result(self, result: TaskResult) -> None:
-        """Save single result to file"""
+    def _build_result_payload(self, result: TaskResult) -> Dict[str, Any]:
+        """Materialise the dict that will be appended to results.jsonl."""
         if self.config.trajectory_only:
             payload: Dict[str, Any] = {
                 "task_id": result.task_id,
                 "success": result.success,
-                "trajectory": result.trajectory.to_dict() if result.trajectory else None
+                "trajectory": result.trajectory.to_dict() if result.trajectory else None,
             }
             if result.error:
                 payload["error"] = result.error
-        else:
-            payload = result.to_dict()
+            return payload
+        return result.to_dict()
+
+    async def _save_result(self, result: TaskResult) -> None:
+        """Append a TaskResult as a single JSON line.
+
+        Concurrency safety:
+        - serialises calls with ``self._save_lock`` so two coroutines
+          can never interleave bytes inside one line;
+        - performs the actual write in a worker thread via
+          ``asyncio.to_thread`` so the event loop is never blocked on disk
+          IO at 100 concurrency;
+        - flushes + fsyncs so a hard kill leaves only fully-written lines
+          on disk (every reader can JSON-decode every surviving line).
+        """
+        payload = self._build_result_payload(result)
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+
+        if self._save_lock is None:
+            self._save_lock = asyncio.Lock()
+
+        async with self._save_lock:
+            await asyncio.to_thread(self._append_line_sync, line)
+
+    def _append_line_sync(self, line: str) -> None:
+        """Synchronous worker for _save_result; do not call from the loop."""
         with open(self.results_file, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
 
     def run(self) -> RolloutSummary:
         """Run pipeline (sync wrapper)"""
