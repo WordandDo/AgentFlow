@@ -468,6 +468,10 @@ class AgentRunner:
                 ),
                 timeout=timeout,
             )
+        except bdb.BdbQuit:
+            # Don't swallow pdb's quit signal; let the operator's exit
+            # request bubble up to the top-level shutdown handler.
+            raise
         except asyncio.TimeoutError:
             msg = f"tool_timeout_{int(timeout)}s"
             log.warning("tool timeout: %s after %.1fs (trace=%s)", tool_name, timeout, trace_id)
@@ -513,6 +517,8 @@ class AgentRunner:
         if isinstance(tool_result, dict):
             try:
                 return format_tool_result(tool_result)
+            except bdb.BdbQuit:
+                raise
             except ValueError as e:
                 log.warning(
                     "no formatter registered for tool %r (trace=%s): %s; "
