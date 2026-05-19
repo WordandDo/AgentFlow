@@ -361,21 +361,44 @@ class AgentRunner:
             )
             
             assistant_message = response.choices[0].message
-            
-            # Convert to our Message format
+
+            # OpenAI tool protocol invariant: every `tool_call_id` recorded
+            # on the assistant message must be answered by a matching
+            # `role="tool"` message in the next turn, or the API rejects
+            # the request. The runner currently executes only the first
+            # tool call (`[:1]`), so the recorded `tool_calls` must be
+            # truncated to that exact set, otherwise N>=2 silently
+            # produces an unanswered tool_call_id and the next chat call
+            # fails with "Invalid tool_call_id" or makes the model loop.
+            assistant_tool_calls = list(assistant_message.tool_calls or [])
+            executed_tool_calls = assistant_tool_calls[:1]
+
+            if len(assistant_tool_calls) > 1:
+                log.warning(
+                    "model returned %d tool_calls; executing the first and "
+                    "truncating recorded tool_calls to keep the assistant/tool "
+                    "message pairing consistent (turn=%d)",
+                    len(assistant_tool_calls), turn_count,
+                )
+
+            recorded_tool_calls = (
+                [tc.model_dump() for tc in executed_tool_calls]
+                if executed_tool_calls else None
+            )
+
             msg = Message(
                 role="assistant",
                 content=assistant_message.content or "",
-                tool_calls=[tc.model_dump() for tc in assistant_message.tool_calls] if assistant_message.tool_calls else None
+                tool_calls=recorded_tool_calls,
             )
             messages.append(msg)
             trajectory.messages.append(msg)
             trajectory.total_turns = turn_count + 1
-            
+
             # Check if there are tool calls
-            if assistant_message.tool_calls:
+            if executed_tool_calls:
                 # Execute tool calls
-                for tool_call in assistant_message.tool_calls[:1]:  # Execute one at a time
+                for tool_call in executed_tool_calls:
                     tool_name = tool_call.function.name
                     try:
                         tool_args = json.loads(tool_call.function.arguments)
