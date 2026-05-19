@@ -69,6 +69,12 @@ class HTTPClientConfig:
     timeout: float = 60.0
     max_retries: int = 3
     retry_delay: float = 1.0
+    # Phase 2S / commit 0.7b (ENG-28): exponential backoff with jitter.
+    # `retry_delay * retry_backoff**attempt` is the per-attempt base
+    # wait; ±retry_jitter is applied multiplicatively so two workers
+    # that hit the same 5xx don't retry in lockstep.
+    retry_backoff: float = 2.0
+    retry_jitter: float = 0.3
     auto_heartbeat: bool = True
     heartbeat_interval: float = 30.0
     worker_id: Optional[str] = None  # Auto-generated when None
@@ -282,63 +288,95 @@ class HTTPServiceClient:
         })
     
     async def _request(
-        self, 
-        method: str, 
-        endpoint: str, 
+        self,
+        method: str,
+        endpoint: str,
         data: Optional[Dict[str, Any]] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """
-        Send HTTP request
-        
-        Args:
-            method: HTTP method
-            endpoint: API endpoint
-            data: request payload
-            timeout: timeout
-            
-        Returns:
-            Response data
+        """Send HTTP request with exponential-backoff retry.
+
+        Phase 2S / commit 0.7b (ENG-28). Retry policy:
+
+        - Timeouts / transient httpx transport errors retry up to
+          ``max_retries`` times with `retry_delay * retry_backoff**attempt`
+          base wait, multiplied by `1 ± retry_jitter` so 100 workers
+          that simultaneously hit the same 5xx don't retry in lockstep.
+        - 5xx responses retry.
+        - 429 responses retry (server is asking us to back off).
+        - Other 4xx responses are **terminal**: they indicate the
+          request itself is wrong, retrying just wastes time.
+        - 2xx returns immediately.
         """
         if self._client is None:
             raise RuntimeError("Client not connected. Call connect() first.")
-        
+
         request_timeout = timeout or self.config.timeout
-        
-        for attempt in range(self.config.max_retries):
+
+        import random
+        max_attempts = max(1, self.config.max_retries)
+        last_err: Optional[HTTPClientError] = None
+
+        for attempt in range(max_attempts):
             try:
                 if method.upper() == "GET":
                     response = await self._client.get(endpoint, timeout=request_timeout)
                 else:
                     response = await self._client.post(
-                        endpoint, 
-                        json=data,
-                        timeout=request_timeout
+                        endpoint, json=data, timeout=request_timeout
                     )
-                
-                result = response.json()
-                
-                if response.status_code >= 400:
-                    error_msg = result.get("message") or result.get("error") or str(result)
-                    raise HTTPClientError(
-                        f"Request failed: {error_msg}",
-                        status_code=response.status_code,
-                        response=result
-                    )
-                
-                return result
-                
-            except httpx.TimeoutException:
-                if attempt == self.config.max_retries - 1:
-                    raise HTTPClientError(f"Request timed out after {self.config.max_retries} attempts")
-                await asyncio.sleep(self.config.retry_delay * (attempt + 1))
-                
+
+                try:
+                    result = response.json()
+                except ValueError:
+                    result = {"message": response.text}
+
+                if response.status_code < 400:
+                    return result
+
+                error_msg = (
+                    result.get("message")
+                    or result.get("error")
+                    or str(result)
+                )
+                err = HTTPClientError(
+                    f"Request failed: {error_msg}",
+                    status_code=response.status_code,
+                    response=result,
+                )
+
+                # 4xx other than 429 is a permanent client error: don't
+                # waste retries on a malformed request.
+                if 400 <= response.status_code < 500 and response.status_code != 429:
+                    raise err
+                # 5xx / 429: retryable.
+                last_err = err
+
+            except HTTPClientError:
+                raise
+            except httpx.TimeoutException as e:
+                last_err = HTTPClientError(f"Request timed out: {e}")
             except httpx.HTTPError as e:
-                if attempt == self.config.max_retries - 1:
-                    raise HTTPClientError(f"HTTP error: {e}")
-                await asyncio.sleep(self.config.retry_delay * (attempt + 1))
-        
-        # Should not reach here, but for type checker
+                last_err = HTTPClientError(f"HTTP error: {e}")
+
+            if attempt >= max_attempts - 1:
+                # Out of attempts; bubble the last seen error.
+                assert last_err is not None
+                raise last_err
+
+            base = self.config.retry_delay * (self.config.retry_backoff ** attempt)
+            jitter_lo = max(0.0, 1.0 - self.config.retry_jitter)
+            jitter_hi = max(jitter_lo, 1.0 + self.config.retry_jitter)
+            wait = base * random.uniform(jitter_lo, jitter_hi)
+            logger.warning(
+                "request %s %s failed (attempt %d/%d): %s; retry in %.2fs",
+                method, endpoint, attempt + 1, max_attempts,
+                last_err, wait,
+            )
+            await asyncio.sleep(wait)
+
+        # Defensive: should be unreachable because the loop always exits
+        # via return / raise above.
         raise HTTPClientError("Request failed after all retries")
     
     # ========================================================================
