@@ -1182,7 +1182,7 @@ server.run()
             timeout=self._config.timeout,
             max_retries=self._config.retry_count,
             worker_id=self._config.worker_id,
-            auto_heartbeat=False
+            auto_heartbeat=True
         )
         self._client = HTTPServiceClient(config=client_config)
     
