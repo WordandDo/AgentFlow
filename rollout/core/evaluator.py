@@ -2,6 +2,14 @@
 Evaluator - evaluates agent predictions against ground truth
 
 Supports multiple metrics: exact_match, f1_score, contains_answer, etc.
+
+The evaluator deliberately uses the *synchronous* OpenAI client
+(`create_openai_client` + `chat_completion`). Rollout itself runs on
+`AsyncOpenAI` (see Phase 1, commit 1.1) but the evaluator is short,
+serial, and called from sync user scripts; keeping it on the sync
+client avoids forcing every downstream caller into an event loop just
+to compute a score. Phase 5 (commit 5.2) will add an opt-in async
+variant for large-scale judge runs.
 """
 
 import re

@@ -17,6 +17,7 @@ from .models import (
 from .evaluator import Evaluator, evaluate_results
 from .utils import (
     create_openai_client,
+    create_async_openai_client,
     chat_completion,
     async_chat_completion,
     load_benchmark_data,
@@ -55,6 +56,7 @@ __all__ = [
     
     # Utils
     "create_openai_client",
+    "create_async_openai_client",
     "chat_completion",
     "async_chat_completion",
     "load_benchmark_data",
