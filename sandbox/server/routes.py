@@ -182,7 +182,17 @@ def register_routes(app: FastAPI, server: "HTTPServiceServer"):
     
     @app.post(HTTPEndpoints.HEARTBEAT)
     async def heartbeat(request: Request):
-        """Heartbeat check"""
+        """Heartbeat: refresh per-session TTL for the calling worker.
+
+        Phase 2S / commit 0.4b (ENG-22): previously this endpoint was a
+        readonly probe (it only listed sessions), so a worker's
+        `auto_heartbeat=True` did *not* actually keep sessions alive.
+        Now we treat each heartbeat as a lease renewal: every active
+        session belonging to the worker has its TTL bumped via
+        `refresh_session`. Combined with the bumped
+        `session_ttl=1800` default, this keeps long-thinking LLMs from
+        losing their VM/Browser session between tool calls.
+        """
         start_time = asyncio.get_event_loop().time()
         data = await request.json()
         worker_id = data.get("worker_id")
@@ -200,10 +210,24 @@ def register_routes(app: FastAPI, server: "HTTPServiceServer"):
 
         sessions = await server.resource_router.list_worker_sessions(worker_id)
 
+        refreshed: list = []
+        for resource_type in list(sessions.keys()):
+            try:
+                ok = await server.resource_router.refresh_session(worker_id, resource_type)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "heartbeat refresh failed for (%s, %s): %r",
+                    worker_id, resource_type, e,
+                )
+                continue
+            if ok:
+                refreshed.append(resource_type)
+
         response = build_success_response(
             data={
                 "worker_id": worker_id,
                 "active_sessions": list(sessions.keys()),
+                "refreshed_sessions": refreshed,
                 "timestamp": datetime.utcnow().isoformat()
             },
             tool="session:heartbeat",

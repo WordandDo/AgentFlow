@@ -51,7 +51,12 @@ DEFAULT_SERVER_CONFIG = {
         # host/port are provided by Sandbox(server_url=...), not in config.
         "title": "Sandbox HTTP Service",
         "description": "HTTP Service for Sandbox",
-        "session_ttl": 300
+        # Phase 2S / commit 0.4b (ENG-22): raised from 300s to 30 min
+        # so a single long LLM thought / long tool call between two
+        # tool calls cannot trip the cleanup_task. Belt-and-braces
+        # works with the new heartbeat-as-lease behaviour (server-side
+        # /heartbeat now actively refreshes per-session TTL).
+        "session_ttl": 1800
     },
     "resources": {
         # Heavy-resource backends (inherit Backend; support sessions and warmup).
@@ -113,7 +118,17 @@ class SandboxConfig:
     # Other settings
     retry_count: int = 3
     log_level: str = "INFO"
-    
+
+    # Phase 2S / commit 0.4b (ENG-22): make heartbeat behaviour
+    # tweakable from the high-level Sandbox config (was hard-coded in
+    # `_create_client`). With the new server-side `/heartbeat` ->
+    # `refresh_session` plumbing, keeping `auto_heartbeat=True` plus a
+    # jittered interval lets long LLM thoughts hold their VM/Browser
+    # session indefinitely without bumping `session_ttl`.
+    auto_heartbeat: bool = True
+    heartbeat_interval: float = 30.0
+    heartbeat_jitter_ratio: float = 0.2
+
     def __post_init__(self):
         if not self.worker_id:
             self.worker_id = f"sandbox_{uuid.uuid4().hex[:8]}"
@@ -1198,7 +1213,12 @@ server.run()
             timeout=self._config.timeout,
             max_retries=self._config.retry_count,
             worker_id=self._config.worker_id,
-            auto_heartbeat=True
+            # Phase 2S / commit 0.4b: forward the SandboxConfig
+            # heartbeat knobs so callers (rollout, tests, ad-hoc users)
+            # can tune behaviour without monkey-patching the client.
+            auto_heartbeat=self._config.auto_heartbeat,
+            heartbeat_interval=self._config.heartbeat_interval,
+            heartbeat_jitter_ratio=self._config.heartbeat_jitter_ratio,
         )
         self._client = HTTPServiceClient(config=client_config)
     
