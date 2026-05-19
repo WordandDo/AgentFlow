@@ -80,6 +80,18 @@ class RolloutConfig:
     log_level: str = "INFO"  # Root log level for the structured handler
     shutdown_timeout: float = 30.0  # Total cleanup budget on graceful shutdown
 
+    # Three-tier timeouts (Phase 0 / commit 0.5).
+    # task: budget for a single benchmark task, including all LLM + tool calls.
+    # llm:  budget for a single chat.completion request (per attempt).
+    # tool: default budget for one sandbox tool call; can be overridden per tool.
+    task_max_seconds: float = 1800.0
+    llm_timeout: float = 120.0
+    tool_default_timeout: float = 60.0
+    tool_timeout_overrides: Dict[str, float] = field(default_factory=lambda: {
+        "vm:start": 120.0,
+        "browser:start": 60.0,
+    })
+
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'RolloutConfig':
         """Create configuration from dictionary"""
@@ -159,6 +171,10 @@ class RolloutConfig:
             "save_summary": self.save_summary,
             "log_level": self.log_level,
             "shutdown_timeout": self.shutdown_timeout,
+            "task_max_seconds": self.task_max_seconds,
+            "llm_timeout": self.llm_timeout,
+            "tool_default_timeout": self.tool_default_timeout,
+            "tool_timeout_overrides": self.tool_timeout_overrides,
         }
 
     def to_json(self, json_path: str):
@@ -240,5 +256,15 @@ class RolloutConfig:
         valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
         if self.log_level.upper() not in valid_log_levels:
             errors.append(f"log_level must be one of {sorted(valid_log_levels)}")
+
+        if self.task_max_seconds <= 0:
+            errors.append("task_max_seconds must be positive")
+        if self.llm_timeout <= 0:
+            errors.append("llm_timeout must be positive")
+        if self.tool_default_timeout <= 0:
+            errors.append("tool_default_timeout must be positive")
+        for name, value in (self.tool_timeout_overrides or {}).items():
+            if not isinstance(value, (int, float)) or value <= 0:
+                errors.append(f"tool_timeout_overrides[{name!r}] must be a positive number")
 
         return errors

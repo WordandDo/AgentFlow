@@ -197,32 +197,49 @@ class AgentRunner:
         ]
 
     async def run_task(self, task: BenchmarkItem) -> TaskResult:
-        """
-        Run agent on a single task.
-        
-        Args:
-            task: Benchmark task item
-            
-        Returns:
-            TaskResult with predicted answer and trajectory
+        """Run agent on a single task with a hard task-level timeout.
+
+        Wraps :meth:`_run_task_inner` in ``asyncio.wait_for`` using
+        ``config.task_max_seconds``. On timeout we synthesise a failing
+        ``TaskResult`` so the caller (pipeline) can still record the
+        attempt and move on.
         """
         if not self._started:
             raise RuntimeError("Runner not started. Call start() first.")
-        
+
+        timeout = float(self.config.task_max_seconds)
+        try:
+            return await asyncio.wait_for(self._run_task_inner(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            err = f"task_timeout_{int(timeout)}s"
+            log.error("task timeout after %.1fs (task=%s)", timeout, task.id)
+            print(f"⏰ Task {task.id} hit task_max_seconds={timeout:.0f}s")
+            return TaskResult(
+                task_id=task.id,
+                question=task.question,
+                predicted_answer="",
+                ground_truth=task.answer,
+                success=False,
+                error=err,
+                metadata=task.metadata,
+            )
+
+    async def _run_task_inner(self, task: BenchmarkItem) -> TaskResult:
+        """Actual task body, called under the task-level wait_for above."""
         print(f"\n{'='*60}")
         print(f"Task: {task.id}")
         print(f"Question: {task.question[:200]}...")
         if task.kwargs:
             print(f"Kwargs: {task.kwargs}")
         print(f"{'='*60}")
-        
+
         start_time = time.time()
         trajectory = Trajectory(
             task_id=task.id,
             question=task.question,
             start_time=datetime.now().isoformat()
         )
-        
+
         try:
             # Build initial messages
             system_prompt = self.config.get_system_prompt()
@@ -299,13 +316,14 @@ class AgentRunner:
             # Prepare messages for API
             api_messages = [m.to_dict() for m in messages]
             
-            # Get response from LLM
+            # Get response from LLM (with per-attempt llm_timeout).
             response = await async_chat_completion(
                 self.client,
                 model=self.config.model_name,
                 messages=api_messages,
                 tools=self.tool_schemas if self.tool_schemas else None,
-                max_retries=self.config.max_retries
+                max_retries=self.config.max_retries,
+                llm_timeout=self.config.llm_timeout,
             )
             
             assistant_message = response.choices[0].message
@@ -412,7 +430,7 @@ class AgentRunner:
         **kwargs,
     ) -> Any:
         """
-        Execute a tool via sandbox.
+        Execute a tool via sandbox with a per-call timeout.
         
         Args:
             tool_name: Name of the tool to execute
@@ -431,10 +449,29 @@ class AgentRunner:
         # This allows seed_path and other kwargs from benchmark jsonl to be passed to tools
         if kwargs:
             parameters = {**parameters, **kwargs}
-        
+
+        timeout = self._resolve_tool_timeout(tool_name)
         try:
-            result = await self.sandbox.execute(tool_name, parameters, trace_id=trace_id)
-            return result
+            # Pass timeout to the sandbox both as an int hint for the server
+            # *and* via asyncio.wait_for so a misbehaving server / network
+            # stall cannot exceed the budget client-side.
+            return await asyncio.wait_for(
+                self.sandbox.execute(
+                    tool_name, parameters,
+                    trace_id=trace_id,
+                    timeout=int(timeout),
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            msg = f"tool_timeout_{int(timeout)}s"
+            log.warning("tool timeout: %s after %.1fs (trace=%s)", tool_name, timeout, trace_id)
+            return {
+                "code": -2,
+                "message": msg,
+                "data": None,
+                "meta": {"trace_id": trace_id, "tool": tool_name},
+            }
         except Exception as e:
             print(f"    ❌ Tool execution error: {e}")
             log.exception("tool execution failed: %s (trace=%s)", tool_name, trace_id)
@@ -442,8 +479,19 @@ class AgentRunner:
                 "code": -1,
                 "message": str(e),
                 "data": None,
-                "meta": {"trace_id": trace_id},
+                "meta": {"trace_id": trace_id, "tool": tool_name},
             }
+
+    def _resolve_tool_timeout(self, tool_name: str) -> float:
+        """Return the per-call timeout for ``tool_name``.
+
+        Honours ``tool_timeout_overrides`` first, then falls back to
+        ``tool_default_timeout``. Returned as float seconds.
+        """
+        overrides = self.config.tool_timeout_overrides or {}
+        if tool_name in overrides:
+            return float(overrides[tool_name])
+        return float(self.config.tool_default_timeout)
 
 
 class SyncAgentRunner:

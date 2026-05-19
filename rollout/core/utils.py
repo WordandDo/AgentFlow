@@ -48,22 +48,48 @@ async def async_chat_completion(
     retry_wait: float = 0.5,
     retry_backoff: float = 2.0,
     retry_exceptions: Tuple[Type[BaseException], ...] = (Exception,),
+    llm_timeout: Optional[float] = None,
     **kwargs: Any
 ) -> Any:
-    """Asynchronous chat completion with retry logic"""
+    """Asynchronous chat completion with retry + per-attempt timeout.
+
+    ``llm_timeout`` bounds each individual ``create`` call via
+    ``asyncio.wait_for``. A timeout is treated like any other retryable
+    failure: we back off and retry up to ``max_retries`` times before
+    re-raising the last error so the caller (runner) can record it.
+    """
     loop = asyncio.get_event_loop()
+    last_err: Optional[BaseException] = None
     for attempt in range(max_retries + 1):
         try:
-            return await loop.run_in_executor(
+            coro = loop.run_in_executor(
                 None,
                 lambda: client.chat.completions.create(**kwargs)
             )
+            if llm_timeout is not None and llm_timeout > 0:
+                return await asyncio.wait_for(coro, timeout=llm_timeout)
+            return await coro
+        except asyncio.TimeoutError as e:
+            last_err = e
+            if attempt >= max_retries:
+                raise
+            wait_time = retry_wait * (retry_backoff ** attempt)
+            print(
+                f"⚠️ LLM timeout after {llm_timeout}s "
+                f"(attempt {attempt + 1}/{max_retries + 1}); retry in {wait_time:.1f}s"
+            )
+            await asyncio.sleep(wait_time)
         except retry_exceptions as e:
+            last_err = e
             if attempt >= max_retries:
                 raise
             wait_time = retry_wait * (retry_backoff ** attempt)
             print(f"⚠️ LLM call failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
             await asyncio.sleep(wait_time)
+    # Should not reach here, but keep mypy / readers happy.
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("async_chat_completion exhausted retries without error")
 
 
 def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
