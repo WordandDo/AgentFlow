@@ -55,6 +55,7 @@ from .core import (
     load_benchmark_data,
     get_timestamp,
 )
+from .core.logging_utils import get_logger, install_root_handler
 from .api import load_config, load_tasks
 
 if TYPE_CHECKING:
@@ -107,4 +108,8 @@ __all__ = [
     "load_tasks",
     "load_benchmark_data",
     "get_timestamp",
+
+    # Logging
+    "get_logger",
+    "install_root_handler",
 ]
