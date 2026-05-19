@@ -10,7 +10,7 @@ import asyncio
 import logging
 import re
 import uuid
-from typing import Dict, Any, Optional, List, Callable, Set
+from typing import Dict, Any, Optional, List, Callable, Set, Tuple
 from datetime import datetime, timedelta
 
 logger = logging.getLogger("ResourceRouter")
@@ -65,7 +65,16 @@ class ResourceRouter:
         self._session_ttl = session_ttl
         self._auto_create = auto_create
         self._session_counter: Dict[str, int] = {}
+        # Short-held metadata lock for routing-table reads/writes. Heavy
+        # initialisation runs OUTSIDE this lock (Phase 2S / commit 2S.1)
+        # so a 30s VM `create_session` cannot stall /health, /status,
+        # destroy_session, or any other in-flight worker's `create_session`
+        # for a different `(worker_id, resource_type)` pair.
         self._lock = asyncio.Lock()
+        # Singleflight registry: concurrent callers for the same
+        # `(worker_id, resource_type)` share the leader's init future
+        # rather than racing to register two duplicate sessions.
+        self._initializing: Dict[Tuple[str, str], asyncio.Future] = {}
     
     def register_resource_type(
         self,
@@ -188,83 +197,129 @@ class ResourceRouter:
             - data: Resource-specific data
             - custom_name: Normalized custom name (if provided)
         """
+        key = (worker_id, resource_type)
+
+        # ---- Step 1: fast path under the short-held metadata lock. ---
+        # We do two things while holding `_lock`:
+        #   (a) return an existing session immediately (extending TTL);
+        #   (b) install a singleflight future for this `(worker_id,
+        #       resource_type)` so concurrent callers share the leader's
+        #       outcome instead of racing to register duplicate sessions.
+        # Heavy `await initializer(...)` work happens AFTER the lock is
+        # released (Step 2) so a 30s VM init does not stall sibling
+        # workers, /health, /status, destroy_session, etc.
+        leader_fut: Optional[asyncio.Future] = None
+        is_leader = False
         async with self._lock:
-            # Initialize worker routing
             if worker_id not in self._routes:
                 self._routes[worker_id] = {}
-            
-            # Check if session already exists
+
             if resource_type in self._routes[worker_id]:
                 session_info = self._routes[worker_id][resource_type]
-                # Update last activity time
                 session_info["last_activity"] = datetime.utcnow().isoformat()
                 session_info["expires_at"] = (
                     datetime.utcnow() + timedelta(seconds=self._session_ttl)
                 ).isoformat()
                 return session_info
-            
-            # Generate session name and ID
-            session_name = self._generate_session_name(worker_id, resource_type, custom_name)
-            session_id = f"{session_name}_{uuid.uuid4().hex[:8]}"
-            
-            init_config = self._merge_resource_config(resource_type, config)
-            
-            session_info = {
-                "session_id": session_id,
-                "session_name": session_name,
-                "worker_id": worker_id,
-                "resource_type": resource_type,
-                "config": init_config,
-                "created_at": datetime.utcnow().isoformat(),
-                "last_activity": datetime.utcnow().isoformat(),
-                "expires_at": (datetime.utcnow() + timedelta(seconds=self._session_ttl)).isoformat(),
-                "status": "initializing",
-                "auto_created": auto_created,
-                "data": {},
-                "custom_name": self._normalize_custom_name(custom_name)
-            }
-            
-            # Call initialization callback
-            if resource_type in self._resource_initializers:
-                try:
-                    initializer = self._resource_initializers[resource_type]
-                    if asyncio.iscoroutinefunction(initializer):
-                        init_result = await initializer(worker_id, init_config)
-                    else:
-                        init_result = initializer(worker_id, init_config)
 
-                    if init_result:
-                        session_info["data"].update(init_result)
-                    session_info["status"] = "active"
-                except Exception as e:
-                    logger.error(f"[{worker_id}] Resource init failed: {resource_type} - {e}")
-                    session_info["status"] = "error"
-                    session_info["error"] = str(e)
+            existing = self._initializing.get(key)
+            if existing is not None and not existing.done():
+                leader_fut = existing
             else:
-                # Resource type has no registered initializer, mark as compatibility creation
+                leader_fut = asyncio.get_running_loop().create_future()
+                self._initializing[key] = leader_fut
+                is_leader = True
+
+            # Snapshot the values we need outside the lock; we never
+            # touch `_routes` again until Step 3.
+            if is_leader:
+                session_name = self._generate_session_name(
+                    worker_id, resource_type, custom_name
+                )
+                session_id = f"{session_name}_{uuid.uuid4().hex[:8]}"
+                init_config = self._merge_resource_config(resource_type, config)
+                normalized_custom = self._normalize_custom_name(custom_name)
+
+        # Non-leader: just await the leader's result and return it.
+        if not is_leader:
+            assert leader_fut is not None
+            return await leader_fut
+
+        # ---- Step 2: do heavy init OUTSIDE the global lock. ----------
+        session_info: Dict[str, Any] = {
+            "session_id": session_id,
+            "session_name": session_name,
+            "worker_id": worker_id,
+            "resource_type": resource_type,
+            "config": init_config,
+            "created_at": datetime.utcnow().isoformat(),
+            "last_activity": datetime.utcnow().isoformat(),
+            "expires_at": (datetime.utcnow() + timedelta(seconds=self._session_ttl)).isoformat(),
+            "status": "initializing",
+            "auto_created": auto_created,
+            "data": {},
+            "custom_name": normalized_custom,
+        }
+
+        if resource_type in self._resource_initializers:
+            try:
+                initializer = self._resource_initializers[resource_type]
+                if asyncio.iscoroutinefunction(initializer):
+                    init_result = await initializer(worker_id, init_config)
+                else:
+                    # Off-load the sync initializer to a worker thread so
+                    # CPU/blocking init does not steal time from the
+                    # event loop while we hold no locks.
+                    init_result = await asyncio.to_thread(
+                        initializer, worker_id, init_config
+                    )
+                if init_result:
+                    session_info["data"].update(init_result)
                 session_info["status"] = "active"
-                session_info["compatibility_mode"] = True
-                session_info["compatibility_message"] = (
-                    f"Resource type '{resource_type}' does not require session initialization. "
-                    f"This session was created for compatibility but no initialization was performed."
+            except Exception as e:
+                logger.error(
+                    f"[{worker_id}] Resource init failed: {resource_type} - {e}"
+                )
+                session_info["status"] = "error"
+                session_info["error"] = str(e)
+        else:
+            session_info["status"] = "active"
+            session_info["compatibility_mode"] = True
+            session_info["compatibility_message"] = (
+                f"Resource type '{resource_type}' does not require session initialization. "
+                f"This session was created for compatibility but no initialization was performed."
+            )
+
+        # ---- Step 3: publish result under the metadata lock. ---------
+        async with self._lock:
+            if session_info.get("status") == "active":
+                self._routes.setdefault(worker_id, {})[resource_type] = session_info
+            # Clear the singleflight slot and wake any pending waiters.
+            cur = self._initializing.get(key)
+            if cur is leader_fut:
+                self._initializing.pop(key, None)
+            if not leader_fut.done():
+                leader_fut.set_result(session_info)
+
+        # Log outside the lock to keep the critical section minimal.
+        create_mode = "AUTO-CREATED" if auto_created else "CREATED"
+        if resource_type not in self._resource_initializers:
+            logger.warning(
+                f"⚠️  [{worker_id}] Session {create_mode} (COMPATIBILITY MODE): {session_name} "
+                f"(id={session_id}, type={resource_type}) - Resource type does not require session"
+            )
+        else:
+            logger.info(
+                f"📦 [{worker_id}] Session {create_mode}: {session_name} "
+                f"(id={session_id}, type={resource_type})"
+            )
+            if auto_created:
+                logger.info(
+                    "   ↳ Note: This session was auto-created when executing command. "
+                    "Use create_session to explicitly create with custom config if needed."
                 )
 
-            self._routes[worker_id][resource_type] = session_info
-
-            # Log message
-            create_mode = "AUTO-CREATED" if auto_created else "CREATED"
-            if resource_type not in self._resource_initializers:
-                # Compatibility creation log
-                logger.warning(
-                    f"⚠️  [{worker_id}] Session {create_mode} (COMPATIBILITY MODE): {session_name} "
-                    f"(id={session_id}, type={resource_type}) - Resource type does not require session"
-                )
-            else:
-                logger.info(f"📦 [{worker_id}] Session {create_mode}: {session_name} (id={session_id}, type={resource_type})")
-                if auto_created:
-                    logger.info(f"   ↳ Note: This session was auto-created when executing command. Use create_session to explicitly create with custom config if needed.")
-            
-            return session_info
+        return session_info
     
     async def get_session(
         self,
