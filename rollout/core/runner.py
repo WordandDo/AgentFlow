@@ -26,7 +26,7 @@ from .models import (
     BenchmarkItem, Trajectory, Message, ToolCall, TaskResult
 )
 from .utils import (
-    create_openai_client,
+    create_async_openai_client,
     async_chat_completion,
     extract_final_answer,
     convert_tool_schema_to_openai,
@@ -65,12 +65,20 @@ class AgentRunner:
         self.worker_id = worker_id or f"runner_{int(time.time())}"
         self.run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
 
-        # Create OpenAI client
-        self.client = create_openai_client(
+        # Create the async OpenAI client. We build this in __init__
+        # rather than start() so callers can construct the runner from
+        # any context (sync or async) without changing the public API;
+        # the underlying httpx.AsyncClient is lazily bound to whichever
+        # event loop ultimately awaits the first request.
+        self.client = create_async_openai_client(
             api_key=self.config.api_key,
             base_url=self.config.base_url,
+            max_connections=self.config.llm_max_connections,
+            max_keepalive=self.config.llm_max_keepalive,
+            timeout_s=self.config.llm_timeout,
+            connect_timeout_s=self.config.llm_connect_timeout,
         )
-        
+
         # Sandbox instance (will be created in start())
         self.sandbox: Optional[Sandbox] = None
         
@@ -181,6 +189,27 @@ class AgentRunner:
                     )
 
                 self.sandbox = None
+
+            # Close the LLM client after sandbox cleanup so any in-flight
+            # tool calls that the runner is no longer waiting on don't
+            # race with httpx pool teardown.
+            if self.client is not None:
+                try:
+                    await asyncio.shield(
+                        asyncio.wait_for(self.client.close(), timeout=5.0)
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+                    log.warning(
+                        "LLM client close timed out/cancelled (worker=%s): %r",
+                        self.worker_id, e,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "LLM client close failed (worker=%s): %r",
+                        self.worker_id, e,
+                    )
+                finally:
+                    self.client = None
 
         finally:
             self._started = False

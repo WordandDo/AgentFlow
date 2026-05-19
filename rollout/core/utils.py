@@ -4,19 +4,64 @@ Utility functions for Rollout pipeline
 
 import asyncio
 import json
+import logging
 import re
 import time
 from typing import Any, Dict, List, Tuple, Type, Optional
+import httpx
 import openai
 
 
+log = logging.getLogger("rollout.utils")
+
+
 def create_openai_client(api_key: str, base_url: str) -> openai.OpenAI:
-    """Create OpenAI client from rollout config only."""
+    """Create a *synchronous* OpenAI client.
+
+    Used by the evaluator path (see commit 1.2) and by user scripts that
+    still want a blocking interface; the runner itself uses the async
+    client returned by :func:`create_async_openai_client`.
+    """
     if not api_key:
         raise ValueError("Missing api_key in rollout config")
     if not base_url:
         raise ValueError("Missing base_url in rollout config")
     return openai.OpenAI(api_key=api_key, base_url=base_url)
+
+
+def create_async_openai_client(
+    api_key: str,
+    base_url: str,
+    *,
+    max_connections: int = 256,
+    max_keepalive: int = 64,
+    timeout_s: float = 120.0,
+    connect_timeout_s: float = 15.0,
+) -> openai.AsyncOpenAI:
+    """Create an :class:`openai.AsyncOpenAI` with an explicit httpx pool.
+
+    The default `loop.run_in_executor(None, ...)` path used previously
+    was capped by Python's default thread pool (~min(32, cpu+4)), which
+    silently throttled concurrency at ~32 concurrent LLM calls. Building
+    on `openai.AsyncOpenAI` plus a custom `httpx.AsyncClient` lifts that
+    cap to whatever the configured connection pool allows.
+
+    Caller owns the returned client and must `await client.close()` on
+    shutdown to release the underlying httpx pool.
+    """
+    if not api_key:
+        raise ValueError("Missing api_key in rollout config")
+    if not base_url:
+        raise ValueError("Missing base_url in rollout config")
+
+    http = httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=max_keepalive,
+        ),
+        timeout=httpx.Timeout(timeout_s, connect=connect_timeout_s),
+    )
+    return openai.AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http)
 
 
 def chat_completion(
@@ -36,13 +81,15 @@ def chat_completion(
             if attempt >= max_retries:
                 raise
             wait_time = retry_wait * (retry_backoff ** attempt)
-            print(f"⚠️ LLM call failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
-            print(f"   Retrying in {wait_time:.1f}s...")
+            log.warning(
+                "LLM call failed (attempt %d/%d): %s; retrying in %.1fs",
+                attempt + 1, max_retries + 1, e, wait_time,
+            )
             time.sleep(wait_time)
 
 
 async def async_chat_completion(
-    client: openai.OpenAI,
+    client: "openai.AsyncOpenAI",
     *,
     max_retries: int = 3,
     retry_wait: float = 0.5,
@@ -53,19 +100,17 @@ async def async_chat_completion(
 ) -> Any:
     """Asynchronous chat completion with retry + per-attempt timeout.
 
-    ``llm_timeout`` bounds each individual ``create`` call via
-    ``asyncio.wait_for``. A timeout is treated like any other retryable
-    failure: we back off and retry up to ``max_retries`` times before
-    re-raising the last error so the caller (runner) can record it.
+    Expects an :class:`openai.AsyncOpenAI` (see
+    :func:`create_async_openai_client`). ``llm_timeout`` bounds each
+    individual ``create`` call via ``asyncio.wait_for``; timeouts are
+    treated like any other retryable failure (back off and retry up to
+    ``max_retries``) before the last error is re-raised so the caller
+    (runner) can record it.
     """
-    loop = asyncio.get_event_loop()
     last_err: Optional[BaseException] = None
     for attempt in range(max_retries + 1):
         try:
-            coro = loop.run_in_executor(
-                None,
-                lambda: client.chat.completions.create(**kwargs)
-            )
+            coro = client.chat.completions.create(**kwargs)
             if llm_timeout is not None and llm_timeout > 0:
                 return await asyncio.wait_for(coro, timeout=llm_timeout)
             return await coro
@@ -74,9 +119,9 @@ async def async_chat_completion(
             if attempt >= max_retries:
                 raise
             wait_time = retry_wait * (retry_backoff ** attempt)
-            print(
-                f"⚠️ LLM timeout after {llm_timeout}s "
-                f"(attempt {attempt + 1}/{max_retries + 1}); retry in {wait_time:.1f}s"
+            log.warning(
+                "LLM timeout after %ss (attempt %d/%d); retry in %.1fs",
+                llm_timeout, attempt + 1, max_retries + 1, wait_time,
             )
             await asyncio.sleep(wait_time)
         except retry_exceptions as e:
@@ -84,7 +129,10 @@ async def async_chat_completion(
             if attempt >= max_retries:
                 raise
             wait_time = retry_wait * (retry_backoff ** attempt)
-            print(f"⚠️ LLM call failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+            log.warning(
+                "LLM call failed (attempt %d/%d): %s: %s; retry in %.1fs",
+                attempt + 1, max_retries + 1, type(e).__name__, e, wait_time,
+            )
             await asyncio.sleep(wait_time)
     # Should not reach here, but keep mypy / readers happy.
     if last_err is not None:

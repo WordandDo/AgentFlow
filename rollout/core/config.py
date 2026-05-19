@@ -95,11 +95,18 @@ class RolloutConfig:
     # tool: default budget for one sandbox tool call; can be overridden per tool.
     task_max_seconds: float = 1800.0
     llm_timeout: float = 120.0
+    llm_connect_timeout: float = 15.0
     tool_default_timeout: float = 60.0
     tool_timeout_overrides: Dict[str, float] = field(default_factory=lambda: {
         "vm:start": 120.0,
         "browser:start": 60.0,
     })
+
+    # AsyncOpenAI HTTPX connection-pool knobs (Phase 1 / commit 1.1).
+    # Raise above the default 100-route worker-pool target so concurrency
+    # is not capped by the underlying TCP pool.
+    llm_max_connections: int = 256
+    llm_max_keepalive: int = 64
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'RolloutConfig':
@@ -182,6 +189,9 @@ class RolloutConfig:
             "shutdown_timeout": self.shutdown_timeout,
             "task_max_seconds": self.task_max_seconds,
             "llm_timeout": self.llm_timeout,
+            "llm_connect_timeout": self.llm_connect_timeout,
+            "llm_max_connections": self.llm_max_connections,
+            "llm_max_keepalive": self.llm_max_keepalive,
             "tool_default_timeout": self.tool_default_timeout,
             "tool_timeout_overrides": self.tool_timeout_overrides,
             "on_duplicate_task_id": self.on_duplicate_task_id,
@@ -271,6 +281,14 @@ class RolloutConfig:
             errors.append("task_max_seconds must be positive")
         if self.llm_timeout <= 0:
             errors.append("llm_timeout must be positive")
+        if self.llm_connect_timeout <= 0:
+            errors.append("llm_connect_timeout must be positive")
+        if self.llm_max_connections < 1:
+            errors.append("llm_max_connections must be >= 1")
+        if self.llm_max_keepalive < 0:
+            errors.append("llm_max_keepalive must be >= 0")
+        if self.llm_max_keepalive > self.llm_max_connections:
+            errors.append("llm_max_keepalive must be <= llm_max_connections")
         if self.tool_default_timeout <= 0:
             errors.append("tool_default_timeout must be positive")
         for name, value in (self.tool_timeout_overrides or {}).items():
