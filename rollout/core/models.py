@@ -172,7 +172,15 @@ class Trajectory:
 
 @dataclass
 class TaskResult:
-    """Result of a single task execution"""
+    """Result of a single task execution.
+
+    ``tool_stats`` (added in Phase 2 / commit 2.4) is a small summary
+    of how the trajectory's tool calls performed (counts by
+    success/failure, per-tool, per-code). It is computed once by the
+    runner so downstream readers don't have to walk the full
+    trajectory. None for tasks that recorded no tool calls (or for
+    very old trajectories before the field existed).
+    """
     task_id: str
     question: str
     predicted_answer: str
@@ -182,6 +190,7 @@ class TaskResult:
     error: Optional[str] = None
     score: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    tool_stats: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
@@ -201,6 +210,8 @@ class TaskResult:
             result["score"] = self.score
         if self.metadata:
             result["metadata"] = self.metadata
+        if self.tool_stats is not None:
+            result["tool_stats"] = self.tool_stats
         return result
 
 
@@ -221,7 +232,13 @@ class EvaluationResult:
 
 @dataclass
 class RolloutSummary:
-    """Summary of a complete rollout run"""
+    """Summary of a complete rollout run.
+
+    `tool_stats` (added in Phase 2 / commit 2.4) is the run-wide
+    aggregate of per-task `TaskResult.tool_stats`; deliberately
+    separate from the answer-correctness `average_score` so the two
+    can be read independently.
+    """
     benchmark_name: str
     total_tasks: int
     successful_tasks: int
@@ -232,6 +249,7 @@ class RolloutSummary:
     results_file: str
     evaluation_file: Optional[str] = None
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    tool_stats: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""

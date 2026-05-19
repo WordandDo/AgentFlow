@@ -46,6 +46,105 @@ def _make_trace_id(run_id: str, worker_id: str, task_id: str, turn: int, suffix:
     return f"{run_id}:{worker_id}:{task_id}:t{turn}:{suffix or uuid.uuid4().hex[:8]}"
 
 
+def _compute_tool_stats(trajectory: Trajectory) -> Optional[Dict[str, Any]]:
+    """Aggregate per-trajectory tool-call counts.
+
+    Returns ``None`` when the trajectory has no tool calls so the field
+    is absent in `TaskResult.to_dict()` and downstream readers don't
+    have to disambiguate "empty stats" from "tool stats not computed".
+
+    The structure intentionally mirrors what the Phase 2 summary will
+    aggregate over: top-line `total/success/failed/success_rate`,
+    plus `by_tool` and `by_code` breakdowns.
+    """
+    tcs = trajectory.tool_calls or []
+    total = len(tcs)
+    if total == 0:
+        return None
+
+    success = sum(1 for tc in tcs if tc.success)
+    by_tool: Dict[str, Dict[str, int]] = {}
+    by_code: Dict[str, int] = {}
+    total_exec_ms = 0.0
+
+    for tc in tcs:
+        entry = by_tool.setdefault(
+            tc.tool_name, {"total": 0, "success": 0, "failed": 0}
+        )
+        entry["total"] += 1
+        if tc.success:
+            entry["success"] += 1
+        else:
+            entry["failed"] += 1
+        if tc.code is not None:
+            key = str(tc.code)
+            by_code[key] = by_code.get(key, 0) + 1
+        try:
+            total_exec_ms += float(tc.execution_time_ms or 0.0)
+        except (TypeError, ValueError):
+            pass
+
+    return {
+        "total": total,
+        "success": success,
+        "failed": total - success,
+        "success_rate": (success / total) if total else 0.0,
+        "execution_time_ms_total": round(total_exec_ms, 3),
+        "by_tool": by_tool,
+        "by_code": by_code,
+    }
+
+
+def _aggregate_tool_stats(results: List["TaskResult"]) -> Optional[Dict[str, Any]]:
+    """Roll up per-task `tool_stats` into a single summary dict.
+
+    Sums counts; the per-tool and per-code maps are merged additively.
+    Returns ``None`` when no task carries `tool_stats` so the summary
+    consumer can omit the field cleanly.
+    """
+    have_any = False
+    total = success = 0
+    total_ms = 0.0
+    by_tool: Dict[str, Dict[str, int]] = {}
+    by_code: Dict[str, int] = {}
+    for r in results:
+        st = r.tool_stats
+        if not isinstance(st, dict):
+            continue
+        have_any = True
+        total += int(st.get("total", 0) or 0)
+        success += int(st.get("success", 0) or 0)
+        try:
+            total_ms += float(st.get("execution_time_ms_total", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+        for name, sub in (st.get("by_tool") or {}).items():
+            if not isinstance(sub, dict):
+                continue
+            entry = by_tool.setdefault(name, {"total": 0, "success": 0, "failed": 0})
+            entry["total"] += int(sub.get("total", 0) or 0)
+            entry["success"] += int(sub.get("success", 0) or 0)
+            entry["failed"] += int(sub.get("failed", 0) or 0)
+        for code, count in (st.get("by_code") or {}).items():
+            try:
+                by_code[str(code)] = by_code.get(str(code), 0) + int(count or 0)
+            except (TypeError, ValueError):
+                continue
+
+    if not have_any:
+        return None
+
+    return {
+        "total": total,
+        "success": success,
+        "failed": total - success,
+        "success_rate": (success / total) if total else 0.0,
+        "execution_time_ms_total": round(total_ms, 3),
+        "by_tool": by_tool,
+        "by_code": by_code,
+    }
+
+
 class AgentRunner:
     """
     Agent Runner that executes tasks using sandbox tools.
@@ -294,6 +393,7 @@ class AgentRunner:
             print(f"✅ Task {task.id} completed")
             print(f"   Final answer: {final_answer[:100]}...")
             
+            tool_stats = _compute_tool_stats(trajectory)
             return TaskResult(
                 task_id=task.id,
                 question=task.question,
@@ -301,7 +401,8 @@ class AgentRunner:
                 ground_truth=task.answer,
                 trajectory=trajectory if self.config.save_trajectories else None,
                 success=True,
-                metadata=task.metadata
+                metadata=task.metadata,
+                tool_stats=tool_stats,
             )
             
         except Exception as e:
@@ -315,6 +416,7 @@ class AgentRunner:
             
             print(f"❌ Task {task.id} failed: {e}")
             
+            tool_stats = _compute_tool_stats(trajectory)
             return TaskResult(
                 task_id=task.id,
                 question=task.question,
@@ -323,7 +425,8 @@ class AgentRunner:
                 trajectory=trajectory if self.config.save_trajectories else None,
                 success=False,
                 error=str(e),
-                metadata=task.metadata
+                metadata=task.metadata,
+                tool_stats=tool_stats,
             )
 
     async def _run_conversation(

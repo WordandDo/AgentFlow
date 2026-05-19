@@ -32,7 +32,7 @@ from .core import (
     load_benchmark_data,
     get_timestamp
 )
-from .core.runner import AgentRunner
+from .core.runner import AgentRunner, _aggregate_tool_stats as aggregate_tool_stats
 from .core.logging_utils import (
     install_root_handler, get_logger, set_context, clear_context, Progress,
     attach_worker_file_handler, detach_handler,
@@ -297,6 +297,12 @@ class RolloutPipeline:
             successful = sum(1 for r in self.results if r.success)
             avg_score = evaluation.get("average_score", 0.0) if evaluation else 0.0
 
+            # Aggregate per-task tool_stats (Phase 2 / commit 2.4). Kept
+            # separate from `average_score` so callers can read the
+            # answer-correctness signal and the tool-execution health
+            # signal independently without conflating them.
+            tool_stats_agg = aggregate_tool_stats(self.results)
+
             summary = RolloutSummary(
                 benchmark_name=self.config.benchmark_name or "benchmark",
                 total_tasks=len(self.results),
@@ -306,7 +312,8 @@ class RolloutPipeline:
                 metric=self.config.evaluation_metric,
                 total_time_seconds=total_time,
                 results_file=self.results_file,
-                evaluation_file=self.eval_file if self.config.evaluate_results else None
+                evaluation_file=self.eval_file if self.config.evaluate_results else None,
+                tool_stats=tool_stats_agg,
             )
 
             # Save summary (optional)
