@@ -9,7 +9,7 @@ import time
 import uuid
 import asyncio
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import bdb
 
 # Import sandbox components directly to avoid server module dependencies
@@ -44,6 +44,81 @@ def _make_trace_id(run_id: str, worker_id: str, task_id: str, turn: int, suffix:
     Keeps the rollout / sandbox / tool logs greppable for a single hop.
     """
     return f"{run_id}:{worker_id}:{task_id}:t{turn}:{suffix or uuid.uuid4().hex[:8]}"
+
+
+def _classify_tool_error(
+    exc: BaseException,
+) -> Tuple[int, str, str, Optional[int]]:
+    """Map a tool-execution exception to ``(code, kind, message, status_code)``.
+
+    Phase 0+ / commit 0.4c-b (ENG-23). The numeric codes use the
+    `<0` convention to avoid colliding with server business codes,
+    and match the buckets in the plan:
+
+      -1   unknown / fallback
+      -2   tool-level wait_for timeout (already produced upstream)
+      -20  httpx ConnectError (DNS / TCP fail)
+      -21  httpx TimeoutException (read/write timeout)
+      -22  HTTPClientError 4xx
+      -23  HTTPClientError 5xx
+      -30  SandboxConnectionError (client never connected)
+
+    `kind` is the stable label written to `ToolCall.error_kind`;
+    aggregations and `jq` filters should prefer it over the numeric
+    code (codes get appended to but kinds stay stable).
+    """
+    # Lazy imports keep the runner import-light when nobody calls a
+    # tool (e.g. unit-test contexts).
+    try:
+        import httpx  # type: ignore
+    except Exception:  # pragma: no cover - httpx is a hard dep
+        httpx = None  # type: ignore[assignment]
+    try:
+        from sandbox.client import HTTPClientError  # type: ignore
+    except Exception:  # pragma: no cover
+        HTTPClientError = None  # type: ignore[assignment]
+    try:
+        from sandbox.sandbox import SandboxConnectionError  # type: ignore
+    except Exception:  # pragma: no cover
+        SandboxConnectionError = None  # type: ignore[assignment]
+
+    msg = str(exc)
+
+    # Order matters: HTTPClientError carries the status_code we need to
+    # split 4xx vs 5xx, but it inherits from Exception (not httpx.HTTPError),
+    # so try the narrowest classes first.
+    if HTTPClientError is not None and isinstance(exc, HTTPClientError):
+        status = getattr(exc, "status_code", None)
+        if status is not None and 400 <= status < 500:
+            return (-22, "client_error", msg, int(status))
+        if status is not None and 500 <= status < 600:
+            return (-23, "server_error", msg, int(status))
+        # Other HTTPClientError (e.g. raised from transport layer):
+        # fall through to the more specific httpx classes below.
+
+    if httpx is not None:
+        # asyncio.TimeoutError is a subclass of httpx.TimeoutException
+        # in modern httpx, but the runner's own task-level wait_for
+        # path catches that BEFORE this helper sees it; here, anything
+        # left is a network read/write timeout.
+        if isinstance(exc, getattr(httpx, "ConnectError", ())):
+            return (-20, "connect", msg, None)
+        if isinstance(exc, getattr(httpx, "TimeoutException", ())):
+            return (-21, "timeout", msg, None)
+        if isinstance(exc, getattr(httpx, "HTTPError", ())):
+            return (-23, "http", msg, None)
+
+    if SandboxConnectionError is not None and isinstance(
+        exc, SandboxConnectionError
+    ):
+        return (-30, "sandbox_disconnect", msg, None)
+
+    if isinstance(exc, asyncio.TimeoutError):
+        return (-21, "timeout", msg, None)
+    if isinstance(exc, asyncio.CancelledError):
+        return (-10, "cancelled", msg, None)
+
+    return (-1, "unknown", msg, None)
 
 
 def _classify_failure_stage(exc: BaseException) -> str:
@@ -117,6 +192,7 @@ def _compute_tool_stats(trajectory: Trajectory) -> Optional[Dict[str, Any]]:
     success = sum(1 for tc in tcs if tc.success)
     by_tool: Dict[str, Dict[str, int]] = {}
     by_code: Dict[str, int] = {}
+    by_kind: Dict[str, int] = {}
     total_exec_ms = 0.0
 
     for tc in tcs:
@@ -131,12 +207,14 @@ def _compute_tool_stats(trajectory: Trajectory) -> Optional[Dict[str, Any]]:
         if tc.code is not None:
             key = str(tc.code)
             by_code[key] = by_code.get(key, 0) + 1
+        if not tc.success and tc.error_kind:
+            by_kind[tc.error_kind] = by_kind.get(tc.error_kind, 0) + 1
         try:
             total_exec_ms += float(tc.execution_time_ms or 0.0)
         except (TypeError, ValueError):
             pass
 
-    return {
+    out: Dict[str, Any] = {
         "total": total,
         "success": success,
         "failed": total - success,
@@ -145,6 +223,9 @@ def _compute_tool_stats(trajectory: Trajectory) -> Optional[Dict[str, Any]]:
         "by_tool": by_tool,
         "by_code": by_code,
     }
+    if by_kind:
+        out["by_error_kind"] = by_kind
+    return out
 
 
 def _aggregate_tool_stats(results: List["TaskResult"]) -> Optional[Dict[str, Any]]:
@@ -159,6 +240,7 @@ def _aggregate_tool_stats(results: List["TaskResult"]) -> Optional[Dict[str, Any
     total_ms = 0.0
     by_tool: Dict[str, Dict[str, int]] = {}
     by_code: Dict[str, int] = {}
+    by_kind: Dict[str, int] = {}
     for r in results:
         st = r.tool_stats
         if not isinstance(st, dict):
@@ -182,11 +264,16 @@ def _aggregate_tool_stats(results: List["TaskResult"]) -> Optional[Dict[str, Any
                 by_code[str(code)] = by_code.get(str(code), 0) + int(count or 0)
             except (TypeError, ValueError):
                 continue
+        for kind, count in (st.get("by_error_kind") or {}).items():
+            try:
+                by_kind[str(kind)] = by_kind.get(str(kind), 0) + int(count or 0)
+            except (TypeError, ValueError):
+                continue
 
     if not have_any:
         return None
 
-    return {
+    out: Dict[str, Any] = {
         "total": total,
         "success": success,
         "failed": total - success,
@@ -195,6 +282,9 @@ def _aggregate_tool_stats(results: List["TaskResult"]) -> Optional[Dict[str, Any
         "by_tool": by_tool,
         "by_code": by_code,
     }
+    if by_kind:
+        out["by_error_kind"] = by_kind
+    return out
 
 
 class AgentRunner:
@@ -628,6 +718,11 @@ class AgentRunner:
                             session_id=meta.get("session_id"),
                             trace_id=meta.get("trace_id") or trace_id,
                             effective_parameters=effective_params,
+                            # Phase 0+ / commit 0.4c-b: surface error
+                            # classification from _execute_tool's meta
+                            # (and gracefully None for success rows).
+                            error_kind=None if success else meta.get("error_kind"),
+                            status_code=meta.get("status_code"),
                         )
                         trajectory.tool_calls.append(tc)
 
@@ -717,23 +812,60 @@ class AgentRunner:
             # Don't swallow pdb's quit signal; let the operator's exit
             # request bubble up to the top-level shutdown handler.
             raise
+        except asyncio.CancelledError:
+            # Cooperate with task-level cancellation; let it bubble.
+            raise
         except asyncio.TimeoutError:
+            # Tool-level wait_for hit. Use the canonical -2 / tool_timeout
+            # bucket regardless of the inner exception so dashboards and
+            # `error_kind` stay stable across all three timeout paths
+            # (task / llm / tool).
             msg = f"tool_timeout_{int(timeout)}s"
             log.warning("tool timeout: %s after %.1fs (trace=%s)", tool_name, timeout, trace_id)
             return ({
                 "code": -2,
                 "message": msg,
                 "data": None,
-                "meta": {"trace_id": trace_id, "tool": tool_name},
+                "meta": {
+                    "trace_id": trace_id,
+                    "tool": tool_name,
+                    "error_kind": "timeout",
+                },
             }, effective_parameters)
         except Exception as e:
-            print(f"    ❌ Tool execution error: {e}")
-            log.exception("tool execution failed: %s (trace=%s)", tool_name, trace_id)
+            # Phase 0+ / commit 0.4c-b: classify the failure so
+            # `ToolCall.error_kind` and the response `meta` carry a
+            # stable label (timeout / connect / client_error /
+            # server_error / sandbox_disconnect / unknown). The numeric
+            # code follows the negative-code convention so dashboards
+            # can split rollout-side failures from server business codes.
+            code, kind, message, status = _classify_tool_error(e)
+            print(f"    ❌ Tool execution error [{kind}]: {e}")
+            # Log at WARNING for known kinds (we already have a structured
+            # error_kind to triage with), EXCEPTION for the unknown bucket
+            # so a stack trace is captured exactly once per surprise.
+            if kind == "unknown":
+                log.exception(
+                    "tool execution failed: %s (trace=%s, kind=unknown)",
+                    tool_name, trace_id,
+                )
+            else:
+                log.warning(
+                    "tool execution failed: %s (trace=%s, kind=%s, status=%s): %s",
+                    tool_name, trace_id, kind, status, message,
+                )
+            meta: Dict[str, Any] = {
+                "trace_id": trace_id,
+                "tool": tool_name,
+                "error_kind": kind,
+            }
+            if status is not None:
+                meta["status_code"] = status
             return ({
-                "code": -1,
-                "message": str(e),
+                "code": code,
+                "message": message,
                 "data": None,
-                "meta": {"trace_id": trace_id, "tool": tool_name},
+                "meta": meta,
             }, effective_parameters)
 
     def _resolve_tool_timeout(self, tool_name: str) -> float:

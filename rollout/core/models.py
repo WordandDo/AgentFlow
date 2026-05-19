@@ -83,6 +83,14 @@ class ToolCall:
     trace_id: Optional[str] = None
     # Args after task_kwargs merge (i.e. what actually hit `sandbox.execute`).
     effective_parameters: Optional[Dict[str, Any]] = None
+    # Phase 0+ / commit 0.4c-b: stable label for "what kind of failure
+    # was this", complementing the numeric `code`. None for success
+    # rows and for older trajectories without the field.
+    # Buckets: "timeout" / "connect" / "client_error" / "server_error"
+    # / "sandbox_disconnect" / "cancelled" / "unknown".
+    error_kind: Optional[str] = None
+    # HTTP status surfaced when the error came back via HTTPClientError.
+    status_code: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
@@ -94,7 +102,8 @@ class ToolCall:
 
         Phase 3 / commit 0.8b: every field is read with ``.get(...,
         default)`` so older jsonl rows (missing later fields such as
-        ``trace_id`` / ``effective_parameters``) deserialise cleanly.
+        ``trace_id`` / ``effective_parameters`` / ``error_kind``)
+        deserialise cleanly.
         """
         return cls(
             tool_name=str(data.get("tool_name", "")),
@@ -110,6 +119,8 @@ class ToolCall:
             session_id=data.get("session_id"),
             trace_id=data.get("trace_id"),
             effective_parameters=data.get("effective_parameters"),
+            error_kind=data.get("error_kind"),
+            status_code=data.get("status_code"),
         )
 
 
