@@ -108,6 +108,38 @@ class RolloutConfig:
     llm_max_connections: int = 256
     llm_max_keepalive: int = 64
 
+    # ---------------------------------------------------------------- #
+    # Phase 2 worker-pool scheduling (commit 2.1).
+    #
+    # `concurrency` is the new canonical knob for how many worker slots
+    # share the run. The legacy `max_workers` is preserved for
+    # backward-compatible JSON/YAML configs and is mapped onto
+    # `concurrency` in `from_dict` (warning emitted).
+    # ---------------------------------------------------------------- #
+    concurrency: int = 1
+    # Per-worker uniform random jitter (seconds) applied at startup so N
+    # workers do not hammer `create_session` simultaneously.
+    worker_startup_jitter: float = 3.0
+    # Optional batched startup: 0 disables, otherwise launch in groups of
+    # `worker_startup_batch_size` separated by `worker_startup_batch_interval`s.
+    worker_startup_batch_size: int = 0
+    worker_startup_batch_interval: float = 5.0
+    # Stop the whole pool on the first worker failure (off by default).
+    fail_fast: bool = False
+    # Keep all TaskResults in `self.results`. Disable for very large runs
+    # that exceed memory; evaluator will then need to read back from disk
+    # (Phase 5). Until that is in place, evaluator+keep_in_memory=False
+    # is rejected by `validate`.
+    keep_results_in_memory: bool = True
+    # Optional client-side QPS cap for the Serper web search backend
+    # (0 disables; takes effect when Phase 2S TokenBucket lands).
+    serper_qps: int = 0
+
+    # Sandbox call retry policy (consumed by Phase 2S / commit 0.7b).
+    sandbox_retry_max: int = 3
+    sandbox_retry_backoff_base: float = 1.0
+    sandbox_retry_jitter: float = 0.5
+
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'RolloutConfig':
         """Create configuration from dictionary"""
@@ -129,6 +161,27 @@ class RolloutConfig:
 
         if "system_prompt" in filtered:
             filtered["system_prompt"] = _normalize_text_field(filtered.get("system_prompt"))
+
+        # Backwards compatibility: legacy configs only had `max_workers`.
+        # Map it onto the new `concurrency` knob (Phase 2 / commit 2.1)
+        # *only* when the user has not already set `concurrency`; that
+        # way an explicit modern config wins, and an unmodified legacy
+        # config produces the same parallelism as before (after Phase 2
+        # actually wires `concurrency` into `_run_parallel`).
+        legacy_mw = config_dict.get("max_workers")
+        explicit_concurrency = "concurrency" in config_dict
+        if (
+            legacy_mw is not None
+            and isinstance(legacy_mw, int)
+            and legacy_mw > 1
+            and not explicit_concurrency
+        ):
+            import logging as _logging
+            _logging.getLogger("rollout.config").warning(
+                "legacy max_workers=%d detected; mapping to concurrency",
+                legacy_mw,
+            )
+            filtered["concurrency"] = legacy_mw
 
         return cls(**filtered)
 
@@ -195,6 +248,17 @@ class RolloutConfig:
             "tool_default_timeout": self.tool_default_timeout,
             "tool_timeout_overrides": self.tool_timeout_overrides,
             "on_duplicate_task_id": self.on_duplicate_task_id,
+            # Worker pool (Phase 2 / commit 2.1).
+            "concurrency": self.concurrency,
+            "worker_startup_jitter": self.worker_startup_jitter,
+            "worker_startup_batch_size": self.worker_startup_batch_size,
+            "worker_startup_batch_interval": self.worker_startup_batch_interval,
+            "fail_fast": self.fail_fast,
+            "keep_results_in_memory": self.keep_results_in_memory,
+            "serper_qps": self.serper_qps,
+            "sandbox_retry_max": self.sandbox_retry_max,
+            "sandbox_retry_backoff_base": self.sandbox_retry_backoff_base,
+            "sandbox_retry_jitter": self.sandbox_retry_jitter,
         }
 
     def to_json(self, json_path: str):
@@ -299,6 +363,32 @@ class RolloutConfig:
         if self.on_duplicate_task_id not in valid_dup_modes:
             errors.append(
                 f"on_duplicate_task_id must be one of {sorted(valid_dup_modes)}"
+            )
+
+        # Worker-pool fields (Phase 2 / commit 2.1).
+        if self.concurrency < 1:
+            errors.append("concurrency must be >= 1")
+        if self.worker_startup_jitter < 0:
+            errors.append("worker_startup_jitter must be >= 0")
+        if self.worker_startup_batch_size < 0:
+            errors.append("worker_startup_batch_size must be >= 0")
+        if self.worker_startup_batch_interval < 0:
+            errors.append("worker_startup_batch_interval must be >= 0")
+        if self.serper_qps < 0:
+            errors.append("serper_qps must be >= 0")
+        if self.sandbox_retry_max < 0:
+            errors.append("sandbox_retry_max must be >= 0")
+        if self.sandbox_retry_backoff_base < 0:
+            errors.append("sandbox_retry_backoff_base must be >= 0")
+        if self.sandbox_retry_jitter < 0:
+            errors.append("sandbox_retry_jitter must be >= 0")
+        # Evaluator needs the in-memory list until the Phase 5 disk reader
+        # lands; reject the dangerous combination loudly rather than
+        # silently producing an evaluation of zero results.
+        if self.evaluate_results and not self.keep_results_in_memory:
+            errors.append(
+                "evaluate_results=True requires keep_results_in_memory=True "
+                "(Phase 5 will add a disk-backed evaluator)"
             )
 
         return errors
