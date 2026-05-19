@@ -84,6 +84,10 @@ class ExecuteRequest(BaseMessage):
     params: Dict[str, Any] = Field(default_factory=dict, description="Action parameters")
     timeout: Optional[int] = Field(default=None, description="Execution timeout in seconds")
     async_mode: bool = False  # Whether to execute asynchronously
+    # Distributed tracing id propagated from rollout. Declared explicitly so
+    # the server-side ExecuteRequest (parsed under extra="ignore") preserves
+    # it and `routes.py` can forward it to tool_executor / response_builder.
+    trace_id: Optional[str] = Field(default=None, description="Trace ID for distributed tracing")
     
     def get_resource_type(self) -> Optional[str]:
         """Parse the resource-type prefix from action."""

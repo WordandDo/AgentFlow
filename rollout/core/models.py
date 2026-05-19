@@ -53,13 +53,28 @@ class BenchmarkItem:
 
 @dataclass
 class ToolCall:
-    """Single tool call record"""
+    """Single tool call record.
+
+    Carries everything an operator needs to debug a single tool
+    invocation. ``formatted_result`` is the human-readable string that
+    was actually sent back to the LLM (i.e. the output of
+    ``sandbox.format_tool_result``); ``result`` keeps the raw
+    ``response["data"]`` for post-hoc analysis.
+    """
     tool_name: str
     parameters: Dict[str, Any]
     result: Any
     success: bool
     error: Optional[str] = None
     execution_time_ms: float = 0.0
+    # Structured fields lifted from the sandbox response. All optional so
+    # older trajectories (without these) still load cleanly.
+    formatted_result: str = ""
+    code: Optional[int] = None
+    message: str = ""
+    resource_type: Optional[str] = None
+    session_id: Optional[str] = None
+    trace_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""

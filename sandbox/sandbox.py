@@ -688,6 +688,7 @@ class Sandbox:
         action: str, 
         params: Optional[Dict[str, Any]] = None,
         timeout: Optional[int] = None,
+        trace_id: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -698,6 +699,8 @@ class Sandbox:
             params: Action parameters
             **kwargs: Extra parameters (merged into params for backend tools)
             timeout: Timeout (seconds)
+            trace_id: Optional trace id, propagated to the server so logs at
+                rollout / sandbox-client / sandbox-server can be aligned.
             
         Returns:
             Execution result
@@ -717,7 +720,7 @@ class Sandbox:
         for key, value in kwargs.items():
             if key not in merged_params and value is not None:
                 merged_params[key] = value
-        return await self._client.execute(action, merged_params, timeout)
+        return await self._client.execute(action, merged_params, timeout, trace_id=trace_id)
     
     def execute_sync(
         self,

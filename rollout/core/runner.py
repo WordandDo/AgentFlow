@@ -6,6 +6,7 @@ Handles multi-turn conversation with tool calling.
 
 import json
 import time
+import uuid
 import asyncio
 from datetime import datetime
 from typing import Dict, List, Any, Optional
@@ -15,7 +16,7 @@ import bdb
 from sandbox import Sandbox, format_tool_result
 
 from .config import RolloutConfig
-from .logging_utils import get_logger
+from .logging_utils import get_logger, set_context, clear_context
 from .models import (
     BenchmarkItem, Trajectory, Message, ToolCall, TaskResult
 )
@@ -31,6 +32,15 @@ from .utils import (
 log = get_logger("rollout.runner")
 
 
+def _make_trace_id(run_id: str, worker_id: str, task_id: str, turn: int, suffix: str) -> str:
+    """Build a stable, human-readable trace_id for a single tool call.
+
+    Format: ``<run>:<worker>:<task>:t<turn>:<tool_call_id_or_uuid>``.
+    Keeps the rollout / sandbox / tool logs greppable for a single hop.
+    """
+    return f"{run_id}:{worker_id}:{task_id}:t{turn}:{suffix or uuid.uuid4().hex[:8]}"
+
+
 class AgentRunner:
     """
     Agent Runner that executes tasks using sandbox tools.
@@ -38,11 +48,18 @@ class AgentRunner:
     Supports multi-turn conversation with tool calling through OpenAI API.
     """
 
-    def __init__(self, config: RolloutConfig, worker_id: Optional[str] = None):
-        """Initialize agent runner"""
+    def __init__(self, config: RolloutConfig, worker_id: Optional[str] = None,
+                 run_id: Optional[str] = None):
+        """Initialize agent runner.
+
+        ``run_id`` is the per-pipeline identity used to scope trace ids;
+        defaults to a short uuid so isolated invocations still produce
+        unique traces.
+        """
         self.config = config
         self.worker_id = worker_id or f"runner_{int(time.time())}"
-        
+        self.run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
+
         # Create OpenAI client
         self.client = create_openai_client(
             api_key=self.config.api_key,
@@ -312,35 +329,61 @@ class AgentRunner:
                         tool_args = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError:
                         tool_args = {}
-                    
+
+                    trace_id = _make_trace_id(
+                        self.run_id, self.worker_id,
+                        trajectory.task_id, turn_count, tool_call.id,
+                    )
+                    ctx_tokens = set_context(trace_id=trace_id)
+
                     print(f"  Turn {turn_count}: 🔧 {tool_name}")
                     print(f"    Args: {json.dumps(tool_args, ensure_ascii=False)[:200]}...")
-                    
-                    # Execute tool with task kwargs merged into parameters
-                    tool_result = await self._execute_tool(tool_name, tool_args, **task_kwargs)
-                    
-                    # Record tool call
-                    tc = ToolCall(
-                        tool_name=tool_name,
-                        parameters=tool_args,
-                        result=tool_result.get("data") if isinstance(tool_result, dict) else tool_result,
-                        success=tool_result.get("code", 0) == 0 if isinstance(tool_result, dict) else True
-                    )
-                    trajectory.tool_calls.append(tc)
-                    
-                    # Format result for message
-                    result_text = format_tool_result_for_message(tool_result)
-                    print(f"    Result: {result_text[:200]}...")
-                    
-                    # Add tool result message
-                    tool_msg = Message(
-                        role="tool",
-                        content=result_text,
-                        tool_call_id=tool_call.id,
-                        name=tool_name
-                    )
-                    messages.append(tool_msg)
-                    trajectory.messages.append(tool_msg)
+
+                    try:
+                        # Execute tool with task kwargs merged into parameters.
+                        tool_result = await self._execute_tool(
+                            tool_name, tool_args, trace_id=trace_id, **task_kwargs)
+
+                        # Structured fields from the canonical sandbox response.
+                        is_dict = isinstance(tool_result, dict)
+                        code = tool_result.get("code") if is_dict else None
+                        message = tool_result.get("message", "") if is_dict else ""
+                        meta = tool_result.get("meta") if is_dict else None
+                        if not isinstance(meta, dict):
+                            meta = {}
+                        success = (code == 0) if code is not None else True
+
+                        result_text = format_tool_result_for_message(tool_result)
+
+                        tc = ToolCall(
+                            tool_name=tool_name,
+                            parameters=tool_args,
+                            result=tool_result.get("data") if is_dict else tool_result,
+                            success=success,
+                            error=None if success else (message or "tool failed"),
+                            execution_time_ms=float(meta.get("execution_time_ms") or 0.0),
+                            formatted_result=result_text,
+                            code=code,
+                            message=message,
+                            resource_type=meta.get("resource_type"),
+                            session_id=meta.get("session_id"),
+                            trace_id=meta.get("trace_id") or trace_id,
+                        )
+                        trajectory.tool_calls.append(tc)
+
+                        print(f"    Result: {result_text[:200]}...")
+
+                        # Add tool result message
+                        tool_msg = Message(
+                            role="tool",
+                            content=result_text,
+                            tool_call_id=tool_call.id,
+                            name=tool_name
+                        )
+                        messages.append(tool_msg)
+                        trajectory.messages.append(tool_msg)
+                    finally:
+                        clear_context(ctx_tokens)
                 
                 turn_count += 1
                 continue
@@ -360,13 +403,22 @@ class AgentRunner:
         
         return "Max turns reached without answer"
 
-    async def _execute_tool(self, tool_name: str, parameters: Dict[str, Any], **kwargs) -> Any:
+    async def _execute_tool(
+        self,
+        tool_name: str,
+        parameters: Dict[str, Any],
+        *,
+        trace_id: Optional[str] = None,
+        **kwargs,
+    ) -> Any:
         """
         Execute a tool via sandbox.
         
         Args:
             tool_name: Name of the tool to execute
             parameters: Tool parameters
+            trace_id: Optional trace id, forwarded so the rollout, client and
+                server logs can be aligned on a single call.
             **kwargs: Additional kwargs to merge into parameters (e.g., seed_path for doc tools)
         
         Returns:
@@ -381,11 +433,17 @@ class AgentRunner:
             parameters = {**parameters, **kwargs}
         
         try:
-            result = await self.sandbox.execute(tool_name, parameters)
+            result = await self.sandbox.execute(tool_name, parameters, trace_id=trace_id)
             return result
         except Exception as e:
             print(f"    ❌ Tool execution error: {e}")
-            return {"code": -1, "message": str(e), "data": None}
+            log.exception("tool execution failed: %s (trace=%s)", tool_name, trace_id)
+            return {
+                "code": -1,
+                "message": str(e),
+                "data": None,
+                "meta": {"trace_id": trace_id},
+            }
 
 
 class SyncAgentRunner:

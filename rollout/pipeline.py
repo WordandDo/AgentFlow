@@ -164,7 +164,7 @@ class RolloutPipeline:
             )
 
             # Create runner
-            runner = AgentRunner(self.config, worker_id="main_runner")
+            runner = AgentRunner(self.config, worker_id="main_runner", run_id=self.run_id)
 
             try:
                 # Start runner
@@ -273,7 +273,11 @@ class RolloutPipeline:
 
             print(f"\n[{idx}/{len(self.benchmark_items)}]", end=" ")
 
-            result = await runner.run_task(item)
+            ctx_tokens = set_context(worker_id=runner.worker_id, task_id=item.id)
+            try:
+                result = await runner.run_task(item)
+            finally:
+                clear_context(ctx_tokens)
             self.results.append(result)
 
             # Save result immediately (atomic append + fsync, see _save_result).

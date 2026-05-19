@@ -317,7 +317,8 @@ class HTTPServiceClient:
         self, 
         action: str,
         params: Optional[Dict[str, Any]] = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        trace_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute tool/action
@@ -329,6 +330,8 @@ class HTTPServiceClient:
             action: Action name; supports resource prefix like "vm:screenshot", "rag:search"
             params: Action parameters
             timeout: Execution timeout
+            trace_id: Optional distributed-trace id. Forwarded to the server
+                in the request body so rollout / sandbox / tool logs align.
             
         Returns:
             Execution result
@@ -343,12 +346,15 @@ class HTTPServiceClient:
             result = await client.execute("echo", {"message": "hello"})
             ```
         """
-        return await self._request("POST", HTTPEndpoints.EXECUTE, {
+        body: Dict[str, Any] = {
             "worker_id": self.worker_id,
             "action": action,
             "params": params or {},
-            "timeout": timeout
-        }, timeout=timeout)
+            "timeout": timeout,
+        }
+        if trace_id:
+            body["trace_id"] = trace_id
+        return await self._request("POST", HTTPEndpoints.EXECUTE, body, timeout=timeout)
     
     async def execute_batch(
         self,
