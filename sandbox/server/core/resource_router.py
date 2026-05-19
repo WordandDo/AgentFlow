@@ -65,6 +65,12 @@ class ResourceRouter:
         self._session_ttl = session_ttl
         self._auto_create = auto_create
         self._session_counter: Dict[str, int] = {}
+        # Phase 2S / commit 2S.3: lifecycle observers notified after a
+        # session is destroyed (whether explicitly, via worker_disconnect,
+        # cleanup_expired, or temp-session teardown). Used by ToolExecutor
+        # to release the matching per-session serial lock so long-running
+        # servers do not accumulate stale `asyncio.Lock` instances.
+        self._destroy_observers: List[Callable[[str, str], None]] = []
         # Short-held metadata lock for routing-table reads/writes. Heavy
         # initialisation runs OUTSIDE this lock (Phase 2S / commit 2S.1)
         # so a 30s VM `create_session` cannot stall /health, /status,
@@ -114,6 +120,26 @@ class ResourceRouter:
             removed = True
         return removed
     
+    def add_destroy_observer(self, observer: Callable[[str, str], None]) -> None:
+        """Register a callback invoked AFTER a session is destroyed.
+
+        Observers receive ``(worker_id, resource_type)`` and must be
+        cheap and synchronous (called inline from `destroy_session`).
+        Exceptions are caught and logged at WARNING so a misbehaving
+        observer cannot block cleanup.
+        """
+        self._destroy_observers.append(observer)
+
+    def _notify_destroy_observers(self, worker_id: str, resource_type: str) -> None:
+        for ob in self._destroy_observers:
+            try:
+                ob(worker_id, resource_type)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "destroy observer raised for (%s, %s): %r",
+                    worker_id, resource_type, e,
+                )
+
     def get_registered_types(self) -> List[str]:
         """Get list of registered resource types"""
         types = set()
@@ -376,7 +402,15 @@ class ResourceRouter:
                 
                 del self._routes[worker_id][resource_type]
                 logger.info(f"🗑️ [{worker_id}] Session DESTROYED: {session_name} (id={session_id}, type={resource_type})")
-                return session_info
+                destroyed = session_info
+            else:
+                destroyed = None
+        if destroyed is not None:
+            # Notify observers OUTSIDE the lock so they can take their
+            # own locks (e.g. ToolExecutor's session_locks_meta) without
+            # deadlocking against the routing-table lock.
+            self._notify_destroy_observers(worker_id, resource_type)
+            return destroyed
         return None
     
     async def destroy_worker_sessions(self, worker_id: str) -> int:

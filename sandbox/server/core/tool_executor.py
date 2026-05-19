@@ -33,7 +33,8 @@ import asyncio
 import logging
 import inspect
 import traceback
-from typing import Dict, Any, Optional, List, Callable, Tuple, TYPE_CHECKING
+from contextlib import asynccontextmanager
+from typing import Dict, Any, Optional, List, Callable, Set, Tuple, TYPE_CHECKING
 
 from .resource_router import ResourceRouter
 from .decorators import scan_tools
@@ -44,6 +45,19 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger("ToolExecutor")
+
+# Resource types whose backends keep mutable in-process state that
+# cannot tolerate concurrent calls from the SAME worker (Phase 2S /
+# commit 2S.3). Anything outside this set (e.g. `rag`, `websearch`,
+# stateless tools) runs unsynchronised so legitimate concurrency
+# inside one worker is preserved.
+DEFAULT_SERIAL_RESOURCE_TYPES: Set[str] = {
+    "vm",
+    "browser",
+    "bash",
+    "code",
+    "mcp",
+}
 
 
 class ToolExecutor:
@@ -64,7 +78,8 @@ class ToolExecutor:
         tool_name_index: Dict[str, List[str]],
         tool_resource_types: Dict[str, str],
         resource_router: ResourceRouter,
-        warmup_callback: Optional[Callable[[str], Any]] = None
+        warmup_callback: Optional[Callable[[str], Any]] = None,
+        serial_resource_types: Optional[Set[str]] = None,
     ):
         """
         Initialize the tool executor.
@@ -75,6 +90,9 @@ class ToolExecutor:
             tool_resource_types: Full-name to resource-type map (by reference).
             resource_router: Resource router instance.
             warmup_callback: Optional warmup callback invoked before execution.
+            serial_resource_types: Resource types whose tool calls must be
+                serialised per `(worker_id, resource_type)`. Defaults to
+                :data:`DEFAULT_SERIAL_RESOURCE_TYPES`.
         """
         # Keep references to external data structures.
         self._tools = tools
@@ -82,6 +100,63 @@ class ToolExecutor:
         self._tool_resource_types = tool_resource_types
         self._resource_router = resource_router
         self._warmup_callback = warmup_callback
+
+        # Phase 2S / commit 2S.3: server-side serial guarantee.
+        # Even with a perfectly behaved worker-pool client, a buggy
+        # rollout may still issue concurrent tool calls for the SAME
+        # `(worker_id, resource_type)`. VM/Browser/Bash backends mutate
+        # in-process state and break in that case; this lock pool is
+        # the server-side belt-and-braces enforcement.
+        self._serial_resources: Set[str] = (
+            set(serial_resource_types)
+            if serial_resource_types is not None
+            else set(DEFAULT_SERIAL_RESOURCE_TYPES)
+        )
+        self._session_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+        # Short-held metadata lock guarding `_session_locks` creation
+        # so two concurrent first-callers never observe two different
+        # `asyncio.Lock` instances.
+        self._session_locks_meta = asyncio.Lock()
+
+    async def _get_session_lock(
+        self, worker_id: str, resource_type: str
+    ) -> asyncio.Lock:
+        """Resolve (or lazily create) the per-session serial lock."""
+        key = (worker_id, resource_type)
+        lock = self._session_locks.get(key)
+        if lock is not None:
+            return lock
+        async with self._session_locks_meta:
+            lock = self._session_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._session_locks[key] = lock
+            return lock
+
+    def drop_session_lock(self, worker_id: str, resource_type: str) -> bool:
+        """Forget the serial lock for a session.
+
+        Should be called when a session is destroyed (router lifecycle
+        hooks); leaving stale locks behind is harmless but accumulates
+        unbounded memory across long-running servers.
+        """
+        return self._session_locks.pop((worker_id, resource_type), None) is not None
+
+    @asynccontextmanager
+    async def _serial_guard(
+        self, worker_id: Optional[str], resource_type: Optional[str]
+    ):
+        """Hold the per-(worker, resource) serial lock when relevant."""
+        if (
+            worker_id
+            and resource_type
+            and resource_type in self._serial_resources
+        ):
+            lock = await self._get_session_lock(worker_id, resource_type)
+            async with lock:
+                yield True
+        else:
+            yield False
 
     def _normalize_tool_name(self, action: str) -> str:
         """
@@ -224,128 +299,141 @@ class ToolExecutor:
             
             func = self._tools[full_name]
             tool_name = simple_name or action
-            
-            # Warm up backend automatically when needed.
-            if resource_type and self._warmup_callback:
-                logger.info(f"   ↳ Warmup backend: {resource_type}")
-                warmup_result = self._warmup_callback(resource_type)
-                # Await coroutine result when callback is async.
-                if asyncio.iscoroutine(warmup_result):
-                    await warmup_result
-                logger.info(f"   ↳ Warmup completed: {resource_type}")
 
-            # Get or create session when resource type is present.
-            session_info = None
-
-            if resource_type:
-                logger.info(f"   ↳ Getting session for resource_type={resource_type}")
-                existing_session = await self._resource_router.get_session(worker_id, resource_type)
-
-                if existing_session:
-                    logger.info(f"   ↳ Using existing session: {existing_session.get('session_id')}")
-                    session_info = existing_session
-                else:
-                    # Auto-create temporary session.
-                    logger.info(f"   ↳ Creating temporary session for {resource_type}")
-                    session_info = await self._resource_router.get_or_create_session(
-                        worker_id=worker_id,
-                        resource_type=resource_type,
-                        auto_created=True
+            # Phase 2S / commit 2S.3: enforce per-(worker, resource_type)
+            # serial execution for stateful backends. The guard is a
+            # no-op when `resource_type not in _serial_resources` so
+            # `rag` / `websearch` / stateless tools remain fully
+            # concurrent within the same worker.
+            async with self._serial_guard(worker_id, resource_type) as is_serial:
+                if is_serial:
+                    logger.debug(
+                        "🔒 serial lock acquired for worker=%s resource=%s",
+                        worker_id, resource_type,
                     )
-                    is_temporary_session = True  # Mark as temporary session.
-                    logger.info(f"🔄 Auto-created temporary session for {resource_type} (worker: {worker_id})")
-                
-                if session_info.get("status") == "error":
-                    return build_error_response(
-                        code=ErrorCode.RESOURCE_NOT_INITIALIZED,
-                        message=f"Resource initialization failed: {session_info.get('error')}",
-                        tool=full_name,
-                        data={"resource_type": resource_type, "details": session_info.get("error")},
-                        execution_time_ms=_elapsed_ms(),
-                        resource_type=resource_type,
-                        session_id=session_info.get("session_id")
-                    )
-            
-            # Auto-inject runtime parameters.
-            sig = inspect.signature(func)
-            has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
-            def inject_if_missing(key, value):
-                """Inject if missing and accepted by function signature."""
-                if key not in params and value is not None:
-                    if key in sig.parameters or has_var_keyword:
-                        params[key] = value
+                # Warm up backend automatically when needed.
+                if resource_type and self._warmup_callback:
+                    logger.info(f"   ↳ Warmup backend: {resource_type}")
+                    warmup_result = self._warmup_callback(resource_type)
+                    # Await coroutine result when callback is async.
+                    if asyncio.iscoroutine(warmup_result):
+                        await warmup_result
+                    logger.info(f"   ↳ Warmup completed: {resource_type}")
 
-            # MCP bridge tools receive all runtime context via session_info
-            # and handle parameter extraction internally in _dispatch().
-            # Injecting worker_id / trace_id / session_id into params would
-            # pollute the MCP tool arguments forwarded to the remote server.
-            if resource_type != "mcp":
-                inject_if_missing("worker_id", worker_id)
-                inject_if_missing("trace_id", trace_id)
+                # Get or create session when resource type is present.
+                session_info = None
+
+                if resource_type:
+                    logger.info(f"   ↳ Getting session for resource_type={resource_type}")
+                    existing_session = await self._resource_router.get_session(worker_id, resource_type)
+
+                    if existing_session:
+                        logger.info(f"   ↳ Using existing session: {existing_session.get('session_id')}")
+                        session_info = existing_session
+                    else:
+                        # Auto-create temporary session.
+                        logger.info(f"   ↳ Creating temporary session for {resource_type}")
+                        session_info = await self._resource_router.get_or_create_session(
+                            worker_id=worker_id,
+                            resource_type=resource_type,
+                            auto_created=True
+                        )
+                        is_temporary_session = True  # Mark as temporary session.
+                        logger.info(f"🔄 Auto-created temporary session for {resource_type} (worker: {worker_id})")
+
+                    if session_info.get("status") == "error":
+                        return build_error_response(
+                            code=ErrorCode.RESOURCE_NOT_INITIALIZED,
+                            message=f"Resource initialization failed: {session_info.get('error')}",
+                            tool=full_name,
+                            data={"resource_type": resource_type, "details": session_info.get("error")},
+                            execution_time_ms=_elapsed_ms(),
+                            resource_type=resource_type,
+                            session_id=session_info.get("session_id")
+                        )
+
+                # Auto-inject runtime parameters.
+                sig = inspect.signature(func)
+                has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+                def inject_if_missing(key, value):
+                    """Inject if missing and accepted by function signature."""
+                    if key not in params and value is not None:
+                        if key in sig.parameters or has_var_keyword:
+                            params[key] = value
+
+                # MCP bridge tools receive all runtime context via session_info
+                # and handle parameter extraction internally in _dispatch().
+                # Injecting worker_id / trace_id / session_id into params would
+                # pollute the MCP tool arguments forwarded to the remote server.
+                if resource_type != "mcp":
+                    inject_if_missing("worker_id", worker_id)
+                    inject_if_missing("trace_id", trace_id)
+
+                    if session_info:
+                        inject_if_missing("session_id", session_info.get("session_id"))
 
                 if session_info:
-                    inject_if_missing("session_id", session_info.get("session_id"))
+                    inject_if_missing("session_info", session_info)
 
-            if session_info:
-                inject_if_missing("session_info", session_info)
-            
-            # Execute tool function.
-            logger.info(f"   ↳ Executing tool function: {full_name}")
-            result = func(**params)
+                # Execute tool function.
+                logger.info(f"   ↳ Executing tool function: {full_name}")
+                result = func(**params)
 
-            # Await coroutine results (including decorated async functions).
-            if asyncio.iscoroutine(result):
-                logger.info(f"   ↳ Awaiting async result...")
-                if timeout:
-                    result = await asyncio.wait_for(result, timeout=timeout)
-                else:
-                    result = await result
-                logger.info(f"   ↳ Async result received")
+                # Await coroutine results (including decorated async functions).
+                if asyncio.iscoroutine(result):
+                    logger.info(f"   ↳ Awaiting async result...")
+                    if timeout:
+                        result = await asyncio.wait_for(result, timeout=timeout)
+                    else:
+                        result = await result
+                    logger.info(f"   ↳ Async result received")
 
-            execution_time = (time.time() - start_time) * 1000
-            logger.info(f"✅ [ToolExecutor] Execute COMPLETED: {action} in {execution_time:.2f}ms")
+                execution_time = (time.time() - start_time) * 1000
+                logger.info(f"✅ [ToolExecutor] Execute COMPLETED: {action} in {execution_time:.2f}ms")
 
-            # Destroy temporary session after execution.
-            if is_temporary_session and resource_type:
-                await self._resource_router.destroy_session(worker_id, resource_type)
-                logger.info(f"🗑️ Destroyed temporary session for {resource_type} (worker: {worker_id})")
-            elif resource_type and session_info:
-                # For persistent sessions, only refresh TTL.
-                logger.info(
-                    "🔄 [ToolExecutor] Refresh session after action: %s (worker=%s, session_id=%s)",
-                    full_name or tool_name,
-                    worker_id,
-                    session_info.get("session_id"),
+                # Destroy temporary session after execution.
+                if is_temporary_session and resource_type:
+                    await self._resource_router.destroy_session(worker_id, resource_type)
+                    self.drop_session_lock(worker_id, resource_type)
+                    logger.info(f"🗑️ Destroyed temporary session for {resource_type} (worker: {worker_id})")
+                elif resource_type and session_info:
+                    # For persistent sessions, only refresh TTL.
+                    logger.info(
+                        "🔄 [ToolExecutor] Refresh session after action: %s (worker=%s, session_id=%s)",
+                        full_name or tool_name,
+                        worker_id,
+                        session_info.get("session_id"),
+                    )
+                    await self._resource_router.refresh_session(worker_id, resource_type)
+
+                # Validate new response format (must include `code`).
+                if isinstance(result, dict) and "code" in result:
+                    # New format: return directly after filling meta fields.
+                    meta = result.get("meta") or {}
+                    if full_name and "tool" not in meta:
+                        meta["tool"] = full_name
+                    if execution_time and "execution_time_ms" not in meta:
+                        meta["execution_time_ms"] = execution_time
+                    if resource_type and "resource_type" not in meta:
+                        meta["resource_type"] = resource_type
+                    if session_info and "session_id" not in meta:
+                        meta["session_id"] = session_info.get("session_id")
+                    if is_temporary_session:
+                        meta["temporary_session"] = True
+                    result["meta"] = meta
+                    return result
+
+                return build_error_response(
+                    code=ErrorCode.UNEXPECTED_ERROR,
+                    message="Tool returned legacy response format; expected {code, message, data, meta}",
+                    tool=full_name or tool_name,
+                    data={"returned_type": type(result).__name__},
+                    execution_time_ms=execution_time,
+                    resource_type=resource_type,
+                    session_id=session_info.get("session_id") if session_info else None
                 )
-                await self._resource_router.refresh_session(worker_id, resource_type)
-
-            # Validate new response format (must include `code`).
-            if isinstance(result, dict) and "code" in result:
-                # New format: return directly after filling meta fields.
-                meta = result.get("meta") or {}
-                if full_name and "tool" not in meta:
-                    meta["tool"] = full_name
-                if execution_time and "execution_time_ms" not in meta:
-                    meta["execution_time_ms"] = execution_time
-                if resource_type and "resource_type" not in meta:
-                    meta["resource_type"] = resource_type
-                if session_info and "session_id" not in meta:
-                    meta["session_id"] = session_info.get("session_id")
-                if is_temporary_session:
-                    meta["temporary_session"] = True
-                result["meta"] = meta
-                return result
-
-            return build_error_response(
-                code=ErrorCode.UNEXPECTED_ERROR,
-                message="Tool returned legacy response format; expected {code, message, data, meta}",
-                tool=full_name or tool_name,
-                data={"returned_type": type(result).__name__},
-                execution_time_ms=execution_time,
-                resource_type=resource_type,
-                session_id=session_info.get("session_id") if session_info else None
-            )
             
         except asyncio.TimeoutError:
             # Ensure temporary session cleanup on timeout.

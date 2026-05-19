@@ -154,6 +154,12 @@ class HTTPServiceServer:
             resource_router=self.resource_router,
             warmup_callback=lambda backend_name: self.ensure_backend_warmed_up(backend_name)
         )
+
+        # Phase 2S / commit 2S.3: when the router destroys a session,
+        # let the executor release its matching per-session serial lock
+        # so long-running servers do not accumulate dead `asyncio.Lock`
+        # instances across many short-lived workers.
+        self.resource_router.add_destroy_observer(self._executor.drop_session_lock)
         
         # Backend holder
         self._backends: Dict[str, Backend] = {}
