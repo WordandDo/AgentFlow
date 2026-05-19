@@ -1,0 +1,72 @@
+{
+  "_comment": "RAG infer @ ~96 worker concurrency. RAG queries are CPU-bound on the server and the QueryBatcher tolerates many concurrent callers, so the rollout-side bottleneck is usually the LLM. See docs/zh-CN/guides/PARALLEL_INFER.md.",
+
+  "benchmark_name": "rag_infer",
+  "model_name": "YOUR_MODEL_NAME",
+  "api_key": "",
+  "base_url": "VLLM_URL",
+
+  "max_turns": 50,
+  "max_retries": 3,
+
+  "available_tools": ["rag_search"],
+
+  "system_prompt": [
+    "You are a helpful research assistant with access to a local knowledge base.",
+    "",
+    "## Available Tools",
+    "1. rag_search - Search the local knowledge base for relevant information",
+    "",
+    "## Strategy",
+    "1. First search the knowledge base for relevant information",
+    "2. Synthesize findings into a clear, concise answer",
+    "",
+    "Always ground your answer in retrieved context and avoid guessing."
+  ],
+
+  "sandbox_server_url": "http://127.0.0.1:18890",
+  "sandbox_timeout": 60,
+
+  "data_path": "benchmark/rag_benchmark.jsonl",
+  "output_dir": "infer_results/rag",
+
+  "evaluate_results": true,
+  "evaluation_metric": "f1_score",
+  "evaluator_model_name": "openai/gpt-oss-120b",
+  "evaluator_api_key": "sk-",
+  "evaluator_base_url": "YOUR_BASE_URL",
+  "evaluator_temperature": 0.0,
+  "evaluator_max_retries": 3,
+  "evaluator_extra_params": {},
+
+  "save_results": true,
+  "save_trajectories": true,
+  "save_summary": true,
+
+  "_comment_parallel": "--- Phase 2 worker-pool scheduling ---",
+  "parallel": true,
+  "concurrency": 96,
+  "worker_startup_jitter": 3.0,
+  "fail_fast": false,
+  "keep_results_in_memory": true,
+  "per_worker_log": true,
+
+  "_comment_timeouts": "--- Phase 0 three-tier timeouts (task / llm / tool) ---",
+  "task_max_seconds": 900,
+  "llm_timeout": 180,
+  "llm_connect_timeout": 15,
+  "tool_default_timeout": 30,
+  "shutdown_timeout": 30,
+
+  "_comment_llm_pool": "--- Phase 1 AsyncOpenAI httpx pool ---",
+  "llm_max_connections": 256,
+  "llm_max_keepalive": 64,
+
+  "_comment_resume": "--- Phase 3 resumable runs ---",
+  "output_filename_strategy": "stable",
+  "resume": false,
+  "resume_retry_failed": true,
+
+  "_comment_data_hygiene": "--- Audit batch ---",
+  "on_duplicate_task_id": "error"
+}

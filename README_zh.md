@@ -137,7 +137,10 @@ pipeline(config_path="configs/infer/web_infer.json")
 | 🖥️ 启动 Sandbox | [`configs/sandbox-server/`](https://github.com/OpenDCAI/AgentFlow/tree/main/configs/sandbox-server/) |
 | 🧪 合成 QA | [`configs/synthesis/`](https://github.com/OpenDCAI/AgentFlow/tree/main/configs/synthesis/) |
 | 🔄 Trajectory Rollout | [`configs/trajectory/`](https://github.com/OpenDCAI/AgentFlow/tree/main/configs/trajectory/) |
-| 🚀 模型推理 | [`configs/infer/`](https://github.com/OpenDCAI/AgentFlow/tree/main/configs/infer/) |
+| 🚀 模型推理（串行） | [`configs/infer/`](https://github.com/OpenDCAI/AgentFlow/tree/main/configs/infer/) |
+| 🧵 模型推理（并发） | [`configs/infer/*.parallel.json`](https://github.com/OpenDCAI/AgentFlow/tree/main/configs/infer/) + [`docs/zh-CN/guides/PARALLEL_INFER.md`](./docs/zh-CN/guides/PARALLEL_INFER.md) |
+
+> 想跑 100 路并发？先读[并发 Inference 调优指南](./docs/zh-CN/guides/PARALLEL_INFER.md)，里面有 Web / RAG / GUI 三套推荐配置和现象→排查表。
 
 ## 🌟 AgentFlow Agent Family
 

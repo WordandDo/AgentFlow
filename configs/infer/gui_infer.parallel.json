@@ -1,0 +1,88 @@
+{
+  "_comment": "GUI/VM infer @ ~8 worker concurrency. VM/Browser sessions are heavy: tune `concurrency` to your host's physical capacity (CPU cores, RAM, display sockets). Server-side serial lock keeps same-worker tool calls ordered. See docs/zh-CN/guides/PARALLEL_INFER.md.",
+
+  "benchmark_name": "gui_infer",
+  "model_name": "YOUR_MODEL_NAME",
+  "api_key": "",
+  "base_url": "VLLM_URL",
+
+  "max_turns": 80,
+  "max_retries": 3,
+
+  "resource_types": ["vm"],
+
+  "available_tools": [
+    "vm:screenshot",
+    "vm:click",
+    "vm:type",
+    "vm:key",
+    "vm:scroll"
+  ],
+
+  "system_prompt": [
+    "You are a desktop automation agent that controls a virtual machine.",
+    "",
+    "## Available Tools",
+    "1. vm:screenshot - Take a screenshot of the current screen",
+    "2. vm:click      - Click at the specified (x, y) coordinates",
+    "3. vm:type       - Type a string of text",
+    "4. vm:key        - Press a key combination (e.g. 'ctrl+a')",
+    "5. vm:scroll     - Scroll in a given direction",
+    "",
+    "## Strategy",
+    "1. Take a screenshot first to understand the current state",
+    "2. Plan one small action at a time and verify with another screenshot",
+    "3. Stop and report the answer once the goal is achieved"
+  ],
+
+  "sandbox_server_url": "http://127.0.0.1:18890",
+  "sandbox_timeout": 120,
+
+  "data_path": "benchmark/gui_benchmark.jsonl",
+  "output_dir": "infer_results/gui",
+
+  "evaluate_results": true,
+  "evaluation_metric": "llm_judgement",
+  "evaluator_model_name": "openai/gpt-oss-120b",
+  "evaluator_api_key": "sk-",
+  "evaluator_base_url": "YOUR_BASE_URL",
+
+  "save_results": true,
+  "save_trajectories": true,
+  "save_summary": true,
+
+  "_comment_parallel": "--- Phase 2 worker-pool: small + batched startup to avoid VM-init storms ---",
+  "parallel": true,
+  "concurrency": 8,
+  "worker_startup_jitter": 10.0,
+  "worker_startup_batch_size": 4,
+  "worker_startup_batch_interval": 30,
+  "fail_fast": false,
+  "keep_results_in_memory": true,
+  "per_worker_log": true,
+
+  "_comment_timeouts": "--- Phase 0 three-tier timeouts; VM tools need longer per-call budgets ---",
+  "task_max_seconds": 1800,
+  "llm_timeout": 180,
+  "llm_connect_timeout": 15,
+  "tool_default_timeout": 120,
+  "tool_timeout_overrides": {
+    "vm:start": 300,
+    "vm:screenshot": 30,
+    "vm:click": 30,
+    "browser:start": 120
+  },
+  "shutdown_timeout": 60,
+
+  "_comment_llm_pool": "--- Phase 1 AsyncOpenAI httpx pool (smaller; GUI runs spend most time in tools) ---",
+  "llm_max_connections": 32,
+  "llm_max_keepalive": 16,
+
+  "_comment_resume": "--- Phase 3 resumable runs ---",
+  "output_filename_strategy": "stable",
+  "resume": false,
+  "resume_retry_failed": true,
+
+  "_comment_data_hygiene": "--- Audit batch ---",
+  "on_duplicate_task_id": "error"
+}

@@ -1,0 +1,68 @@
+{
+  "_comment": "Web infer @ ~16 worker concurrency. Tuned for Serper/Jina rate limits; raise `concurrency` only if your upstream search quota allows. See docs/zh-CN/guides/PARALLEL_INFER.md for the full tuning guide.",
+
+  "benchmark_name": "web_infer",
+  "model_name": "YOUR_MODEL_NAME",
+  "api_key": "",
+  "base_url": "VLLM_URL",
+
+  "max_turns": 40,
+  "max_retries": 3,
+
+  "available_tools": ["web_search", "web_visit"],
+  "sandbox_server_url": "http://127.0.0.1:18890",
+  "sandbox_timeout": 60,
+
+  "system_prompt": [
+    "You are a web research assistant that can search and browse the internet.",
+    "",
+    "## Available Tools",
+    "1. web_search - Search the web with multiple queries",
+    "2. web_visit  - Visit web pages and extract content",
+    "",
+    "## Strategy",
+    "1. Formulate effective search queries",
+    "2. Visit promising URLs to get detailed information",
+    "3. Synthesize findings into a clear answer with sources"
+  ],
+
+  "data_path": "benchmark/web_benchmark.jsonl",
+  "output_dir": "infer_results/web",
+
+  "evaluate_results": true,
+  "evaluation_metric": "contains_answer",
+  "evaluator_model_name": "openai/gpt-oss-120b",
+  "evaluator_api_key": "sk-",
+  "evaluator_base_url": "YOUR_BASE_URL",
+
+  "save_results": true,
+  "save_trajectories": true,
+  "save_summary": true,
+
+  "_comment_parallel": "--- Phase 2 worker-pool scheduling ---",
+  "parallel": true,
+  "concurrency": 16,
+  "worker_startup_jitter": 1.0,
+  "fail_fast": false,
+  "keep_results_in_memory": true,
+  "per_worker_log": true,
+
+  "_comment_timeouts": "--- Phase 0 three-tier timeouts (task / llm / tool) ---",
+  "task_max_seconds": 600,
+  "llm_timeout": 120,
+  "llm_connect_timeout": 15,
+  "tool_default_timeout": 60,
+  "shutdown_timeout": 30,
+
+  "_comment_llm_pool": "--- Phase 1 AsyncOpenAI httpx pool ---",
+  "llm_max_connections": 64,
+  "llm_max_keepalive": 32,
+
+  "_comment_resume": "--- Phase 3 resumable runs ---",
+  "output_filename_strategy": "stable",
+  "resume": false,
+  "resume_retry_failed": true,
+
+  "_comment_data_hygiene": "--- Audit batch ---",
+  "on_duplicate_task_id": "error"
+}
