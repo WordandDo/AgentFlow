@@ -88,6 +88,30 @@ class ToolCall:
         """Convert to dictionary"""
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ToolCall':
+        """Rebuild a ToolCall from its `to_dict` payload.
+
+        Phase 3 / commit 0.8b: every field is read with ``.get(...,
+        default)`` so older jsonl rows (missing later fields such as
+        ``trace_id`` / ``effective_parameters``) deserialise cleanly.
+        """
+        return cls(
+            tool_name=str(data.get("tool_name", "")),
+            parameters=dict(data.get("parameters") or {}),
+            result=data.get("result"),
+            success=bool(data.get("success", True)),
+            error=data.get("error"),
+            execution_time_ms=float(data.get("execution_time_ms", 0.0) or 0.0),
+            formatted_result=str(data.get("formatted_result", "") or ""),
+            code=data.get("code"),
+            message=str(data.get("message", "") or ""),
+            resource_type=data.get("resource_type"),
+            session_id=data.get("session_id"),
+            trace_id=data.get("trace_id"),
+            effective_parameters=data.get("effective_parameters"),
+        )
+
 
 @dataclass
 class Message:
@@ -154,12 +178,19 @@ class Trajectory:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Trajectory':
-        """Create from dictionary"""
+        """Create from dictionary.
+
+        Phase 3 / commit 0.8b (ENG-32): now actually restores
+        ``tool_calls`` via :meth:`ToolCall.from_dict` so resume,
+        replay, and offline analysis can introspect them. Previously
+        this returned an empty list, silently losing data on every
+        round-trip through disk.
+        """
         return cls(
             task_id=data.get("task_id", ""),
             question=data.get("question", ""),
             messages=[Message.from_dict(m) for m in data.get("messages", [])],
-            tool_calls=[],  # Not reconstructing tool calls from dict
+            tool_calls=[ToolCall.from_dict(tc) for tc in (data.get("tool_calls") or [])],
             final_answer=data.get("final_answer", ""),
             total_turns=data.get("total_turns", 0),
             success=data.get("success", False),
@@ -180,6 +211,13 @@ class TaskResult:
     runner so downstream readers don't have to walk the full
     trajectory. None for tasks that recorded no tool calls (or for
     very old trajectories before the field existed).
+
+    Phase 3 / commit 3.2 (ENG-12): the failure-classification block
+    (``task_status`` ... ``retryable``) is populated by
+    ``AgentRunner`` on every failure path. Downstream consumers can
+    then ``jq 'select(.task_fail==true)'`` to triage a run without
+    grepping stack traces. All fields default to None so older
+    trajectories deserialise cleanly.
     """
     task_id: str
     question: str
@@ -191,6 +229,18 @@ class TaskResult:
     score: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     tool_stats: Optional[Dict[str, Any]] = None
+
+    # Failure classification (Phase 3 / commit 3.2). Present on
+    # failures only; success rows leave them None.
+    task_status: Optional[str] = None  # "completed" | "failed" | "task_timeout"
+    task_fail: Optional[bool] = None
+    failure_stage: Optional[str] = None  # e.g. "llm", "tool", "task", "guard"
+    failure_type: Optional[str] = None   # exception class name (TimeoutError, ...)
+    failure_message: Optional[str] = None
+    failed_turn: Optional[int] = None
+    failed_tool_name: Optional[str] = None
+    failed_trace_id: Optional[str] = None
+    retryable: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
@@ -212,6 +262,24 @@ class TaskResult:
             result["metadata"] = self.metadata
         if self.tool_stats is not None:
             result["tool_stats"] = self.tool_stats
+
+        # Failure classification - only persist when populated so
+        # success rows stay compact.
+        for fld in (
+            "task_status",
+            "task_fail",
+            "failure_stage",
+            "failure_type",
+            "failure_message",
+            "failed_turn",
+            "failed_tool_name",
+            "failed_trace_id",
+            "retryable",
+        ):
+            v = getattr(self, fld)
+            if v is not None:
+                result[fld] = v
+
         return result
 
 

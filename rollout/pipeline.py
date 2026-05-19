@@ -162,7 +162,7 @@ class RolloutPipeline:
             task_id_set = set(self.config.task_ids)
             items = [item for item in items if item.id in task_id_set]
             print(f"   Filtered to {len(items)} specific tasks")
-        
+
         # Limit number of tasks if specified
         if self.config.number_of_tasks is not None:
             items = items[:self.config.number_of_tasks]
@@ -171,6 +171,78 @@ class RolloutPipeline:
         print(f"   Loaded {len(items)} tasks")
         self.benchmark_items = items
         return items
+
+    def _load_completed_task_ids(self) -> set:
+        """Return the set of task_ids already present in the results file.
+
+        Phase 3 / commit 3.2 (ENG-11, ENG-12). Used by ``load_benchmark``
+        when ``config.resume`` is True. Honors
+        ``config.resume_retry_failed``:
+          - True (default) -> only successful rows count as "completed";
+            previously failed tasks are retried.
+          - False -> any row counts as completed (failures stay failed).
+
+        Reads from ``config.resume_file`` if set, otherwise from the
+        pipeline's own ``results_file``. Malformed lines are skipped
+        with a warning so a single bad row doesn't abort resume.
+        """
+        path = self.config.resume_file or self.results_file
+        if not path or not os.path.exists(path):
+            return set()
+
+        store = ResultStore(path)
+        done: set = set()
+        retry_failed = self.config.resume_retry_failed
+        bad = 0
+        for raw in store.iter_lines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                bad += 1
+                continue
+            tid = obj.get("task_id")
+            if not tid:
+                continue
+            if retry_failed and not bool(obj.get("success", False)):
+                # Skip failures so they get re-run.
+                continue
+            done.add(tid)
+
+        if bad:
+            log.warning("resume: skipped %d malformed jsonl line(s) in %s", bad, path)
+        log.info(
+            "resume: %d completed task_ids loaded from %s (retry_failed=%s)",
+            len(done), path, retry_failed,
+        )
+        return done
+
+    def _apply_resume_filter(self) -> None:
+        """Drop benchmark items whose task_id is already in the
+        results file when ``config.resume`` is True.
+
+        Idempotent: re-applying does nothing because the second pass
+        finds nothing left to skip. Safe to call from both
+        ``load_benchmark`` (the from-disk path) and ``run_async``
+        (handles callers that pre-populate `benchmark_items`).
+        """
+        if not self.config.resume or not self.benchmark_items:
+            return
+        done = self._load_completed_task_ids()
+        if not done:
+            return
+        before = len(self.benchmark_items)
+        self.benchmark_items = [
+            it for it in self.benchmark_items if it.id not in done
+        ]
+        skipped = before - len(self.benchmark_items)
+        if skipped:
+            src = self.config.resume_file or self.results_file
+            print(
+                f"   Resume: skipping {skipped} already-completed task(s) from {src}"
+            )
 
     def _check_duplicate_task_ids(self, items: List[BenchmarkItem]) -> None:
         """Enforce the ``on_duplicate_task_id`` policy.
@@ -245,6 +317,11 @@ class RolloutPipeline:
             # Load benchmark
             if not self.benchmark_items:
                 self.load_benchmark()
+
+            # Phase 3 / commit 3.2: resume by skipping previously-completed
+            # task_ids. Applied here (not in load_benchmark) so callers
+            # that pre-set `benchmark_items` directly still get resume.
+            self._apply_resume_filter()
 
             print(f"\n{'='*80}")
             print(f"🚀 Rollout Pipeline (run_id={self.run_id})")

@@ -46,6 +46,58 @@ def _make_trace_id(run_id: str, worker_id: str, task_id: str, turn: int, suffix:
     return f"{run_id}:{worker_id}:{task_id}:t{turn}:{suffix or uuid.uuid4().hex[:8]}"
 
 
+def _classify_failure_stage(exc: BaseException) -> str:
+    """Best-effort mapping from an exception type to a failure stage.
+
+    The bucket names are picked to be greppable in `results_*.jsonl`:
+    ``llm`` / ``tool`` / ``task`` / ``connect`` / ``guard``. The full
+    per-status classification (4xx vs 5xx, etc.) is deferred to the
+    larger 0.4c-b commit; this helper is intentionally a small switch
+    so the resume commit stays focused.
+    """
+    name = type(exc).__name__
+    if name in ("TimeoutError", "asyncio.TimeoutError"):
+        return "timeout"
+    # `openai` errors are imported lazily to keep import-light.
+    try:
+        import openai  # type: ignore
+        if isinstance(exc, getattr(openai, "APIError", ())):
+            return "llm"
+    except Exception:  # pragma: no cover - openai always installed
+        pass
+    try:
+        import httpx  # type: ignore
+        if isinstance(exc, getattr(httpx, "ConnectError", ())):
+            return "connect"
+        if isinstance(exc, getattr(httpx, "HTTPError", ())):
+            return "http"
+    except Exception:  # pragma: no cover
+        pass
+    if "SandboxConnection" in name:
+        return "sandbox_connect"
+    if "HTTPClient" in name:
+        return "http"
+    return "task"
+
+
+def _is_retryable_failure(exc: BaseException) -> bool:
+    """Should resume mode retry this failure on its own?
+
+    Conservative defaults: only flag obviously-transient failures
+    (timeouts, network blips) as retryable. Anything else has to be
+    explicitly retried by the operator via `resume_retry_failed=True`.
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    try:
+        import httpx  # type: ignore
+        if isinstance(exc, getattr(httpx, "HTTPError", ())):
+            return True
+    except Exception:  # pragma: no cover
+        pass
+    return False
+
+
 def _compute_tool_stats(trajectory: Trajectory) -> Optional[Dict[str, Any]]:
     """Aggregate per-trajectory tool-call counts.
 
@@ -355,6 +407,13 @@ class AgentRunner:
                 success=False,
                 error=err,
                 metadata=task.metadata,
+                # Phase 3 / commit 3.2: structured failure classification.
+                task_status="task_timeout",
+                task_fail=True,
+                failure_stage="task",
+                failure_type="TimeoutError",
+                failure_message=err,
+                retryable=True,
             )
 
     async def _run_task_inner(self, task: BenchmarkItem) -> TaskResult:
@@ -403,20 +462,33 @@ class AgentRunner:
                 success=True,
                 metadata=task.metadata,
                 tool_stats=tool_stats,
+                task_status="completed",
+                task_fail=False,
             )
             
         except Exception as e:
             if isinstance(e, bdb.BdbQuit):
                 raise
-            
+
             trajectory.success = False
             trajectory.error = str(e)
             trajectory.end_time = datetime.now().isoformat()
             trajectory.execution_time_ms = (time.time() - start_time) * 1000
-            
+
             print(f"❌ Task {task.id} failed: {e}")
-            
+
             tool_stats = _compute_tool_stats(trajectory)
+            stage = _classify_failure_stage(e)
+            # Best-effort breadcrumbs from the last recorded tool call:
+            # tells operators which tool / trace_id the run died on.
+            last_tool = (
+                trajectory.tool_calls[-1].tool_name
+                if trajectory.tool_calls else None
+            )
+            last_trace = (
+                trajectory.tool_calls[-1].trace_id
+                if trajectory.tool_calls else None
+            )
             return TaskResult(
                 task_id=task.id,
                 question=task.question,
@@ -427,6 +499,15 @@ class AgentRunner:
                 error=str(e),
                 metadata=task.metadata,
                 tool_stats=tool_stats,
+                task_status="failed",
+                task_fail=True,
+                failure_stage=stage,
+                failure_type=type(e).__name__,
+                failure_message=str(e)[:500],
+                failed_turn=trajectory.total_turns or None,
+                failed_tool_name=last_tool,
+                failed_trace_id=last_trace,
+                retryable=_is_retryable_failure(e),
             )
 
     async def _run_conversation(
