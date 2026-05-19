@@ -13,6 +13,7 @@ This module provides the main RolloutPipeline class that handles:
 import json
 import os
 import sys
+import random
 import uuid
 import asyncio
 import argparse
@@ -33,7 +34,7 @@ from .core import (
 )
 from .core.runner import AgentRunner
 from .core.logging_utils import (
-    install_root_handler, get_logger, set_context, clear_context,
+    install_root_handler, get_logger, set_context, clear_context, Progress,
 )
 from .core.shutdown import ShutdownManager
 
@@ -101,6 +102,11 @@ class RolloutPipeline:
         self.run_id = f"run_{uuid.uuid4().hex[:8]}"
         self._save_lock: Optional[asyncio.Lock] = None
         self._shutdown: Optional[ShutdownManager] = None
+
+        # Live counters for the worker-pool scheduler (Phase 2 / 2.2).
+        # Updated by `_record_result` and shown on the progress bar.
+        self._stats_ok: int = 0
+        self._stats_fail: int = 0
 
     def load_benchmark(self) -> List[BenchmarkItem]:
         """Load benchmark data"""
@@ -206,37 +212,38 @@ class RolloutPipeline:
                 len(self.benchmark_items), self.config.model_name, self.config.parallel,
             )
 
-            # Create runner
-            runner = AgentRunner(self.config, worker_id="main_runner", run_id=self.run_id)
-
-            try:
-                # Start runner
-                print("Starting runner...")
-                success = await runner.start()
-                if not success:
-                    raise RuntimeError("Failed to start runner")
-
-                # Run tasks
-                if self.config.parallel and self.config.max_workers > 1:
-                    await self._run_parallel(runner)
-                else:
-                    await self._run_sequential(runner)
-
-            finally:
-                # Cancel-safe cleanup, bounded by shutdown_timeout.
-                print("\n🔌 Stopping runner...")
+            # Worker-pool path owns its own runners (one per slot, each
+            # with a unique worker_id). Sequential path keeps the
+            # historical single "main_runner" so single-worker runs
+            # match pre-2.2 behaviour exactly.
+            use_pool = self.config.parallel and self.config.concurrency > 1
+            if use_pool:
+                await self._run_parallel()
+            else:
+                runner = AgentRunner(
+                    self.config, worker_id="main_runner", run_id=self.run_id
+                )
                 try:
-                    await asyncio.shield(
-                        asyncio.wait_for(
-                            runner.stop(), timeout=self.config.shutdown_timeout
+                    print("Starting runner...")
+                    success = await runner.start()
+                    if not success:
+                        raise RuntimeError("Failed to start runner")
+                    await self._run_sequential(runner)
+                finally:
+                    # Cancel-safe cleanup, bounded by shutdown_timeout.
+                    print("\n🔌 Stopping runner...")
+                    try:
+                        await asyncio.shield(
+                            asyncio.wait_for(
+                                runner.stop(), timeout=self.config.shutdown_timeout
+                            )
                         )
-                    )
-                except (asyncio.TimeoutError, asyncio.CancelledError) as e:
-                    log.warning(
-                        "runner.stop() did not finish within shutdown_timeout=%ss (%r); "
-                        "server session may be cleaned by TTL",
-                        self.config.shutdown_timeout, e,
-                    )
+                    except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+                        log.warning(
+                            "runner.stop() did not finish within shutdown_timeout=%ss (%r); "
+                            "server session may be cleaned by TTL",
+                            self.config.shutdown_timeout, e,
+                        )
 
             # Evaluate results
             evaluation = None
@@ -344,22 +351,230 @@ class RolloutPipeline:
                 result = await runner.run_task(item)
             finally:
                 clear_context(ctx_tokens)
-            self.results.append(result)
-
-            # Save result immediately (atomic append + fsync, see _save_result).
+            self._record_result(result)
             if self.config.save_results:
                 await self._save_result(result)
 
-    async def _run_parallel(self, runner: AgentRunner) -> None:
-        """Run tasks in parallel using thread pool"""
-        # Note: For true parallelism, we'd need multiple runner instances
-        # This implementation uses sequential execution with async for simplicity
-        # True parallel would require multiple sandbox sessions
-        
-        print(f"⚠️ Parallel mode with max_workers={self.config.max_workers}")
-        print("   Note: Using sequential execution (parallel requires multiple sandbox sessions)")
-        
-        await self._run_sequential(runner)
+    # ------------------------------------------------------------------
+    # Worker-pool scheduler (Phase 2 / commit 2.2).
+    # ------------------------------------------------------------------
+
+    async def _run_parallel(self) -> None:
+        """Run tasks across an N-slot worker pool.
+
+        Each slot owns a unique `worker_id`, a private `AgentRunner`,
+        and (via the runner) an independent sandbox session, so two
+        slots can hold isolated VM/Browser/Bash state at the same time
+        (ENG-3). Tasks are pulled from a single `asyncio.Queue` so we
+        retain the existing "first done, first served" semantics
+        without forcing a particular task->worker affinity.
+
+        Shutdown integrates with `ShutdownManager`: when the shared
+        event fires we cancel the workers; each worker's `finally` runs
+        a cancel-safe `runner.stop()` bounded by `shutdown_timeout`.
+        """
+        n = len(self.benchmark_items)
+        concurrency = max(1, int(self.config.concurrency))
+        log.info(
+            "starting worker pool: concurrency=%d, total_tasks=%d, run_id=%s",
+            concurrency, n, self.run_id,
+        )
+        print(f"\n🧵 Worker pool: concurrency={concurrency}, total_tasks={n}\n")
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for item in self.benchmark_items:
+            queue.put_nowait(item)
+
+        progress = Progress(total=n, desc=f"rollout[c={concurrency}]")
+
+        workers: List[asyncio.Task] = []
+        for i in range(concurrency):
+            workers.append(asyncio.create_task(
+                self._spawn_worker(i, queue, progress),
+                name=f"worker-{i:03d}",
+            ))
+
+        shutdown_event = (
+            self._shutdown.event if self._shutdown is not None else asyncio.Event()
+        )
+        shutdown_waiter = asyncio.create_task(shutdown_event.wait(), name="shutdown-waiter")
+
+        try:
+            # Wait for either: (a) all workers finish naturally, or
+            # (b) shutdown is requested. asyncio.wait + FIRST_COMPLETED
+            # gives us both edges in one place.
+            await asyncio.wait(
+                workers + [shutdown_waiter],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if shutdown_event.is_set():
+                log.warning(
+                    "shutdown triggered; cancelling %d workers", len(workers),
+                )
+                for w in workers:
+                    if not w.done():
+                        w.cancel()
+            else:
+                shutdown_waiter.cancel()
+
+            # Give each worker time to run its `finally` (which calls
+            # cancel-safe runner.stop()).
+            if workers:
+                await asyncio.wait(workers, timeout=self.config.shutdown_timeout)
+                # Belt-and-braces: anything still running gets cancelled
+                # and awaited so we don't leak event-loop tasks.
+                for w in workers:
+                    if not w.done():
+                        w.cancel()
+                # Swallow CancelledError here; per-worker logs already
+                # captured anything noteworthy.
+                await asyncio.gather(*workers, return_exceptions=True)
+        finally:
+            if not shutdown_waiter.done():
+                shutdown_waiter.cancel()
+                try:
+                    await shutdown_waiter
+                except (asyncio.CancelledError, Exception):
+                    pass
+            progress.close()
+
+    async def _spawn_worker(
+        self,
+        idx: int,
+        queue: asyncio.Queue,
+        progress: Progress,
+    ) -> None:
+        """One worker slot: own a runner, pull tasks, drain on shutdown."""
+        worker_id = f"rollout_{self.run_id}_w{idx:03d}"
+        ctx_tokens = set_context(worker_id=worker_id)
+
+        try:
+            # Startup jitter: stagger N workers so they do not all call
+            # sandbox `create_session` in the same millisecond (ENG-14).
+            if self.config.worker_startup_jitter > 0:
+                await asyncio.sleep(
+                    random.uniform(0.0, float(self.config.worker_startup_jitter))
+                )
+            # Optional batched startup: each batch waits an extra
+            # `batch_interval` so even the post-jitter spread does not
+            # exceed a configured QPS into the server.
+            if self.config.worker_startup_batch_size > 0:
+                batch_idx = idx // int(self.config.worker_startup_batch_size)
+                if batch_idx > 0:
+                    await asyncio.sleep(
+                        batch_idx * float(self.config.worker_startup_batch_interval)
+                    )
+
+            runner = AgentRunner(self.config, worker_id=worker_id, run_id=self.run_id)
+            try:
+                ok = await runner.start()
+                if not ok:
+                    log.error(
+                        "worker %s failed to start; aborting this worker only",
+                        worker_id,
+                    )
+                    if self.config.fail_fast and self._shutdown is not None:
+                        log.error("fail_fast=True; signalling shutdown")
+                        self._shutdown.event.set()
+                    return
+
+                while True:
+                    if self._shutdown is not None and self._shutdown.triggered:
+                        break
+                    try:
+                        item = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                    task_tokens = set_context(task_id=item.id)
+                    try:
+                        result = await self._run_one_with_guard(runner, item)
+                        self._record_result(result)
+                        if self.config.save_results:
+                            await self._save_result(result)
+                        try:
+                            await progress.update(postfix={
+                                "ok": self._stats_ok,
+                                "fail": self._stats_fail,
+                            })
+                        except Exception as e:
+                            # Progress display must never break the run.
+                            log.debug("progress update failed: %r", e)
+                        if (
+                            not result.success
+                            and self.config.fail_fast
+                            and self._shutdown is not None
+                        ):
+                            log.warning(
+                                "fail_fast=True and task %s failed; signalling shutdown",
+                                item.id,
+                            )
+                            self._shutdown.event.set()
+                    finally:
+                        clear_context(task_tokens)
+                        queue.task_done()
+            except asyncio.CancelledError:
+                log.warning("worker %s cancelled", worker_id)
+                raise
+            finally:
+                # Cancel-safe per-worker cleanup. Each worker bounds its
+                # own stop, so one stuck session cannot block the rest.
+                try:
+                    await asyncio.shield(
+                        asyncio.wait_for(
+                            runner.stop(), timeout=self.config.shutdown_timeout
+                        )
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+                    log.warning(
+                        "worker %s runner.stop() did not finish in time: %r",
+                        worker_id, e,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "worker %s runner.stop() failed: %r", worker_id, e,
+                    )
+        finally:
+            clear_context(ctx_tokens)
+
+    async def _run_one_with_guard(
+        self,
+        runner: AgentRunner,
+        item: BenchmarkItem,
+    ) -> TaskResult:
+        """Per-task safety net for the worker loop.
+
+        `AgentRunner.run_task` already converts known errors into a
+        failing `TaskResult`; this guard catches the rest (e.g. a
+        late-thrown protocol error) and turns it into the same shape so
+        the pool keeps moving. `asyncio.CancelledError` re-raises so the
+        outer worker can run its cleanup.
+        """
+        try:
+            return await runner.run_task(item)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("task %s unexpected error in worker loop", item.id)
+            return TaskResult(
+                task_id=item.id,
+                question=item.question,
+                predicted_answer="",
+                ground_truth=item.answer,
+                success=False,
+                error=f"worker_guard:{type(e).__name__}:{e}",
+                metadata=item.metadata,
+            )
+
+    def _record_result(self, result: TaskResult) -> None:
+        """Update live counters and (optionally) the in-memory results."""
+        if result.success:
+            self._stats_ok += 1
+        else:
+            self._stats_fail += 1
+        if self.config.keep_results_in_memory:
+            self.results.append(result)
 
     def _build_result_payload(self, result: TaskResult) -> Dict[str, Any]:
         """Materialise the dict that will be appended to results.jsonl."""
