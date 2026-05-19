@@ -855,31 +855,44 @@ class Sandbox:
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        await self.close()
+        """Async context manager exit (destroys server-side sessions)."""
+        await self.close(destroy_sessions=True)
     
     # ========================================================================
     # Close
     # ========================================================================
     
-    async def close(self):
-        """Close connection"""
+    async def close(self, destroy_sessions: bool = True):
+        """Close the sandbox.
+
+        Phase 2S / commit 2S.5 (folds in 0.7a / ENG-27): the default is
+        now ``destroy_sessions=True`` so a normal ``async with Sandbox()``
+        teardown actively tells the server to drop this worker's
+        sessions (via ``/api/v1/worker/disconnect``) instead of waiting
+        for the server-side TTL to expire. Callers that need the old
+        "leave sessions hanging" behaviour can pass ``False`` explicitly.
+        """
         if not self._connected:
             return
-        
+
         if self._client:
-            await self._client.close()
-            self._client = None
-        
+            try:
+                await self._client.close(destroy_sessions=destroy_sessions)
+            finally:
+                self._client = None
+
         self._connected = False
         self._started = False
-        logger.info(f"👋 Sandbox closed (worker_id: {self.worker_id})")
-    
-    def close_sync(self):
+        logger.info(
+            "👋 Sandbox closed (worker_id: %s, destroy_sessions=%s)",
+            self.worker_id, destroy_sessions,
+        )
+
+    def close_sync(self, destroy_sessions: bool = True):
         """Close connection (sync version)"""
         if not self._connected:
             return
-        self._run_async(self.close())
+        self._run_async(self.close(destroy_sessions=destroy_sessions))
     
     # ========================================================================
     # Shutdown Server

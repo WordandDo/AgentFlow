@@ -603,14 +603,39 @@ class HTTPServiceServer:
             logger.info("HTTP Service Server shutting down...")
             if self._cleanup_task:
                 self._cleanup_task.cancel()
+                # Best-effort drain so the periodic cleaner does not log
+                # spurious CancelledError after shutdown finishes.
+                try:
+                    await asyncio.wait_for(self._cleanup_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
 
-            # Cleanup all sessions before shutdown to ensure VM/container resources are released
+            # Phase 2S / commit 2S.5 (ENG-16): bound shutdown-time
+            # session cleanup with a hard timeout so a single stuck
+            # VM/Browser cleaner cannot block server shutdown forever.
+            # Default budget is 60s (plan default); plenty for ~100
+            # sessions yet still finite under pathological conditions.
+            shutdown_cleanup_budget = 60.0
             try:
-                all_sessions = await self.resource_router.list_all_sessions()
-                cleaned_count = 0
-                for worker_id in list(all_sessions.keys()):
-                    cleaned_count += await self.resource_router.destroy_worker_sessions(worker_id)
+                async def _cleanup_all_sessions() -> int:
+                    all_sessions = await self.resource_router.list_all_sessions()
+                    cleaned_count = 0
+                    for worker_id in list(all_sessions.keys()):
+                        cleaned_count += await self.resource_router.destroy_worker_sessions(
+                            worker_id
+                        )
+                    return cleaned_count
+
+                cleaned_count = await asyncio.wait_for(
+                    _cleanup_all_sessions(), timeout=shutdown_cleanup_budget
+                )
                 logger.info("Cleaned %s sessions before shutdown", cleaned_count)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Shutdown session cleanup exceeded %.1fs budget; "
+                    "some VM/container resources may need manual reclaim",
+                    shutdown_cleanup_budget,
+                )
             except Exception as exc:
                 logger.error("Failed to cleanup sessions before shutdown: %s", exc)
 
