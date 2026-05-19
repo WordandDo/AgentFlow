@@ -364,7 +364,7 @@ class AgentRunner:
 
                     try:
                         # Execute tool with task kwargs merged into parameters.
-                        tool_result = await self._execute_tool(
+                        tool_result, effective_params = await self._execute_tool(
                             tool_name, tool_args, trace_id=trace_id, **task_kwargs)
 
                         # Structured fields from the canonical sandbox response.
@@ -391,6 +391,7 @@ class AgentRunner:
                             resource_type=meta.get("resource_type"),
                             session_id=meta.get("session_id"),
                             trace_id=meta.get("trace_id") or trace_id,
+                            effective_parameters=effective_params,
                         )
                         trajectory.tool_calls.append(tc)
 
@@ -433,41 +434,49 @@ class AgentRunner:
         *,
         trace_id: Optional[str] = None,
         **kwargs,
-    ) -> Any:
+    ) -> tuple:
         """
         Execute a tool via sandbox with a per-call timeout.
         
         Args:
             tool_name: Name of the tool to execute
-            parameters: Tool parameters
+            parameters: Tool parameters (from the LLM)
             trace_id: Optional trace id, forwarded so the rollout, client and
                 server logs can be aligned on a single call.
             **kwargs: Additional kwargs to merge into parameters (e.g., seed_path for doc tools)
         
         Returns:
-            Tool execution result
+            ``(result, effective_parameters)`` where ``effective_parameters``
+            is the merged kwargs+parameters dict that actually went to the
+            sandbox. Always returned so callers can record both views even
+            on failure.
         """
         if not self.sandbox:
             raise RuntimeError("Sandbox not initialized")
         
-        # Merge kwargs into parameters (similar to synthesis worker)
-        # This allows seed_path and other kwargs from benchmark jsonl to be passed to tools
-        if kwargs:
-            parameters = {**parameters, **kwargs}
+        # Merge kwargs into parameters (similar to synthesis worker).
+        # This allows seed_path and other kwargs from benchmark jsonl to be
+        # passed to tools. We preserve the *historical* precedence
+        # (`{**parameters, **kwargs}` -> kwargs wins) so existing
+        # benchmarks behave identically after the change. The original
+        # LLM-provided dict is kept untouched in `ToolCall.parameters`
+        # for audit; the merged dict is exposed as `effective_parameters`.
+        effective_parameters = {**(parameters or {}), **(kwargs or {})}
 
         timeout = self._resolve_tool_timeout(tool_name)
         try:
             # Pass timeout to the sandbox both as an int hint for the server
             # *and* via asyncio.wait_for so a misbehaving server / network
             # stall cannot exceed the budget client-side.
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self.sandbox.execute(
-                    tool_name, parameters,
+                    tool_name, effective_parameters,
                     trace_id=trace_id,
                     timeout=int(timeout),
                 ),
                 timeout=timeout,
             )
+            return result, effective_parameters
         except bdb.BdbQuit:
             # Don't swallow pdb's quit signal; let the operator's exit
             # request bubble up to the top-level shutdown handler.
@@ -475,21 +484,21 @@ class AgentRunner:
         except asyncio.TimeoutError:
             msg = f"tool_timeout_{int(timeout)}s"
             log.warning("tool timeout: %s after %.1fs (trace=%s)", tool_name, timeout, trace_id)
-            return {
+            return ({
                 "code": -2,
                 "message": msg,
                 "data": None,
                 "meta": {"trace_id": trace_id, "tool": tool_name},
-            }
+            }, effective_parameters)
         except Exception as e:
             print(f"    ❌ Tool execution error: {e}")
             log.exception("tool execution failed: %s (trace=%s)", tool_name, trace_id)
-            return {
+            return ({
                 "code": -1,
                 "message": str(e),
                 "data": None,
                 "meta": {"trace_id": trace_id, "tool": tool_name},
-            }
+            }, effective_parameters)
 
     def _resolve_tool_timeout(self, tool_name: str) -> float:
         """Return the per-call timeout for ``tool_name``.

@@ -60,6 +60,12 @@ class ToolCall:
     was actually sent back to the LLM (i.e. the output of
     ``sandbox.format_tool_result``); ``result`` keeps the raw
     ``response["data"]`` for post-hoc analysis.
+
+    ``parameters`` is what the LLM produced; ``effective_parameters``
+    is what the runner actually sent to the sandbox after merging
+    benchmark ``task_kwargs`` (e.g. ``seed_path``). Keeping both lets
+    operators audit "why did the call use a different path than the
+    one the model asked for?" without staring at the runner code.
     """
     tool_name: str
     parameters: Dict[str, Any]
@@ -75,6 +81,8 @@ class ToolCall:
     resource_type: Optional[str] = None
     session_id: Optional[str] = None
     trace_id: Optional[str] = None
+    # Args after task_kwargs merge (i.e. what actually hit `sandbox.execute`).
+    effective_parameters: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
