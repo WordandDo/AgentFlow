@@ -10,12 +10,90 @@ import os
 import json
 import http.client
 import asyncio
+import asyncio
+import logging
+import threading
 import time
 from typing import Dict, Any, List, Union, Optional
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import openai
+
+
+logger = logging.getLogger("WebSearch")
+
+
+# -----------------------------------------------------------------------------
+# Shared executor pool (Phase 2S / commit 2S.4 / ENG-5).
+#
+# Previously SearchTool / VisitTool created a fresh `ThreadPoolExecutor`
+# inside each invocation. Under 100 concurrent worker rollouts that
+# produced ~500 transient threads per second; if the GIL or upstream
+# rate-limit caused contention the server would briefly thrash.
+#
+# Module-level executors are created lazily on first use, sized from the
+# tool's `max_workers` config (clamped >= 1), and reused for the lifetime
+# of the process. They are intentionally not bounded to a single pool
+# because search and visit have different rate-limit profiles.
+# -----------------------------------------------------------------------------
+
+_search_executor: Optional[ThreadPoolExecutor] = None
+_visit_executor: Optional[ThreadPoolExecutor] = None
+_executor_lock = threading.Lock()
+
+
+def _get_or_create_executor(slot: str, max_workers: int) -> ThreadPoolExecutor:
+    """Return the named module-level executor, creating it on first use.
+
+    `max_workers` is honoured only on first creation; subsequent calls
+    reuse the existing pool. This is the correct trade-off for the
+    sandbox - we'd rather a slightly mis-sized pool than churn 500
+    threads/sec under load.
+    """
+    global _search_executor, _visit_executor
+    capacity = max(1, int(max_workers))
+    with _executor_lock:
+        if slot == "search":
+            if _search_executor is None:
+                _search_executor = ThreadPoolExecutor(
+                    max_workers=capacity,
+                    thread_name_prefix="websearch-search",
+                )
+                logger.info(
+                    "created shared websearch.search executor (max_workers=%d)",
+                    capacity,
+                )
+            return _search_executor
+        if slot == "visit":
+            if _visit_executor is None:
+                _visit_executor = ThreadPoolExecutor(
+                    max_workers=capacity,
+                    thread_name_prefix="websearch-visit",
+                )
+                logger.info(
+                    "created shared websearch.visit executor (max_workers=%d)",
+                    capacity,
+                )
+            return _visit_executor
+        raise ValueError(f"unknown executor slot: {slot!r}")
+
+
+def _shutdown_shared_executors(wait: bool = False) -> None:
+    """Test/teardown helper: drop the shared executors.
+
+    Kept module-private; the server lifespan doesn't currently call
+    this because Python will reap the threads on interpreter exit, but
+    tests can use it to assert pool reuse.
+    """
+    global _search_executor, _visit_executor
+    with _executor_lock:
+        if _search_executor is not None:
+            _search_executor.shutdown(wait=wait)
+            _search_executor = None
+        if _visit_executor is not None:
+            _visit_executor.shutdown(wait=wait)
+            _visit_executor = None
 
 # crawl4ai is an optional dependency.
 try:
@@ -395,15 +473,19 @@ class SearchTool(BaseApiTool):
         elif isinstance(query, list):
             results = []
             errors = []
-            
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(client.search_single, q): q for q in query}
-                for future in futures:
-                    try:
-                        results.append(future.result())
-                    except Exception as e:
-                        q = futures[future]
-                        errors.append(f"Query '{q}' failed: {str(e)}")
+
+            # Phase 2S / commit 2S.4: reuse a single module-level
+            # executor instead of spawning `max_workers` threads on
+            # every call. The first SearchTool invocation determines
+            # the pool size; subsequent calls reuse it.
+            executor = _get_or_create_executor("search", max_workers)
+            futures = {executor.submit(client.search_single, q): q for q in query}
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    q = futures[future]
+                    errors.append(f"Query '{q}' failed: {str(e)}")
 
             if not results and errors:
                 raise ToolBusinessError(f"All queries failed. Errors: {'; '.join(errors)}", ErrorCode.EXECUTION_ERROR)
@@ -498,11 +580,11 @@ class VisitTool(BaseApiTool):
             except Exception as e:
                 return {"success": False, "url": url, "error": str(e)}
 
-        # 4. Run in parallel.
-        results = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = executor.map(process_url_sync, urls)
-            results = list(futures)
+        # 4. Run in parallel using the shared module-level executor
+        # (Phase 2S / commit 2S.4). Prevents 100 workers x N urls from
+        # producing hundreds of transient threads per second.
+        executor = _get_or_create_executor("visit", max_workers)
+        results = list(executor.map(process_url_sync, urls))
 
         # 5. Aggregate results.
         successful = [r for r in results if r['success']]

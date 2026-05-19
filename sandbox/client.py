@@ -72,7 +72,16 @@ class HTTPClientConfig:
     auto_heartbeat: bool = True
     heartbeat_interval: float = 30.0
     worker_id: Optional[str] = None  # Auto-generated when None
-    
+    # Phase 2S / commit 2S.4: explicit httpx connection-pool sizing so
+    # 100 rollout workers don't all share httpx's default 100/20 pool
+    # and serialize each other on connection acquisition.
+    max_connections: int = 64
+    max_keepalive_connections: int = 16
+    # ±jitter_ratio uniform jitter on each heartbeat sleep so N workers
+    # don't synchronise their heartbeats into a single periodic spike
+    # against the server (ENG-6). 0 disables jitter.
+    heartbeat_jitter_ratio: float = 0.2
+
     def __post_init__(self):
         if not self.worker_id:
             self.worker_id = f"worker_{uuid.uuid4().hex[:8]}"
@@ -169,9 +178,19 @@ class HTTPServiceClient:
     async def connect(self):
         """Establish connection"""
         if self._client is None:
+            # Phase 2S / commit 2S.4: explicit pool sizing so 100
+            # workers don't all share httpx's default 100/20 pool. Each
+            # rollout worker owns its own client, so the per-worker
+            # cap here is the per-worker concurrent in-flight cap to
+            # the sandbox server (default 64 plenty for one worker).
+            limits = httpx.Limits(
+                max_connections=self.config.max_connections,
+                max_keepalive_connections=self.config.max_keepalive_connections,
+            )
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=self.config.timeout,
+                limits=limits,
                 headers={
                     "Content-Type": "application/json",
                     "X-Worker-ID": self.worker_id
@@ -233,10 +252,23 @@ class HTTPServiceClient:
         logger.info(f"HTTPServiceClient closed (worker_id: {self.worker_id})")
     
     async def _heartbeat_loop(self):
-        """Heartbeat loop"""
+        """Heartbeat loop with ±jitter.
+
+        Phase 2S / commit 2S.4 (ENG-6): N workers running the same
+        ``heartbeat_interval`` would otherwise synchronise into a
+        periodic spike at the server. Applying ±``heartbeat_jitter_ratio``
+        uniform jitter on each sleep desynchronises them; the long-run
+        rate is unchanged.
+        """
+        # Lazy import inside the loop so the rest of the module remains
+        # import-light (random is std-lib but importing it once is fine).
+        import random
+        base = max(0.0, float(self.config.heartbeat_interval))
+        jitter = max(0.0, float(self.config.heartbeat_jitter_ratio))
         while not self._closed:
             try:
-                await asyncio.sleep(self.config.heartbeat_interval)
+                wait = base * (1.0 + random.uniform(-jitter, jitter)) if jitter > 0 else base
+                await asyncio.sleep(wait)
                 await self._send_heartbeat()
             except asyncio.CancelledError:
                 break
