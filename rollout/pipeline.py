@@ -113,7 +113,14 @@ class RolloutPipeline:
         
         # Convert to BenchmarkItem
         items = [BenchmarkItem.from_dict(item) for item in raw_data]
-        
+
+        # Duplicate task_id is a data-hygiene bug: results/evaluation/
+        # checkpoint/resume all join on task_id, so duplicates silently
+        # overwrite each other. Run the check on the *raw* item list
+        # (before id-filter / number-of-tasks slicing) so users see the
+        # actual condition of their dataset.
+        self._check_duplicate_task_ids(items)
+
         # Filter by task_ids if specified
         if self.config.task_ids:
             task_id_set = set(self.config.task_ids)
@@ -128,6 +135,42 @@ class RolloutPipeline:
         print(f"   Loaded {len(items)} tasks")
         self.benchmark_items = items
         return items
+
+    def _check_duplicate_task_ids(self, items: List[BenchmarkItem]) -> None:
+        """Enforce the ``on_duplicate_task_id`` policy.
+
+        Mode is taken from ``RolloutConfig.on_duplicate_task_id``:
+        ``"error"`` raises ``ValueError`` (default, fail-fast); ``"warn"``
+        logs and continues; ``"ignore"`` is a no-op. Duplicate ids are
+        reported in encounter order (truncated to 10 in the message).
+        """
+        mode = getattr(self.config, "on_duplicate_task_id", "error")
+        if mode == "ignore":
+            return
+
+        seen = set()
+        duplicates: List[str] = []
+        for it in items:
+            if it.id in seen:
+                duplicates.append(it.id)
+            else:
+                seen.add(it.id)
+
+        if not duplicates:
+            return
+
+        shown = duplicates[:10]
+        more = "" if len(duplicates) <= 10 else f" (+{len(duplicates) - 10} more)"
+        msg = (
+            f"benchmark data contains {len(duplicates)} duplicate task_id(s): "
+            f"{shown}{more}"
+        )
+
+        if mode == "error":
+            raise ValueError(msg)
+        if mode == "warn":
+            log.warning(msg)
+            print(f"⚠️  {msg}")
 
     async def run_async(self) -> RolloutSummary:
         """Run pipeline asynchronously"""

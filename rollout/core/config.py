@@ -80,6 +80,15 @@ class RolloutConfig:
     log_level: str = "INFO"  # Root log level for the structured handler
     shutdown_timeout: float = 30.0  # Total cleanup budget on graceful shutdown
 
+    # Benchmark data hygiene. Downstream stages (results, evaluation,
+    # checkpoint, resume) all join on `task_id`, so duplicates silently
+    # overwrite each other. Default fails fast; teams with legacy data
+    # can downgrade to "warn".
+    #     "error" -> raise ValueError and abort the run
+    #     "warn"  -> log a warning, keep all rows (including duplicates)
+    #     "ignore" -> no diagnostic, keep all rows
+    on_duplicate_task_id: str = "error"
+
     # Three-tier timeouts (Phase 0 / commit 0.5).
     # task: budget for a single benchmark task, including all LLM + tool calls.
     # llm:  budget for a single chat.completion request (per attempt).
@@ -175,6 +184,7 @@ class RolloutConfig:
             "llm_timeout": self.llm_timeout,
             "tool_default_timeout": self.tool_default_timeout,
             "tool_timeout_overrides": self.tool_timeout_overrides,
+            "on_duplicate_task_id": self.on_duplicate_task_id,
         }
 
     def to_json(self, json_path: str):
@@ -266,5 +276,11 @@ class RolloutConfig:
         for name, value in (self.tool_timeout_overrides or {}).items():
             if not isinstance(value, (int, float)) or value <= 0:
                 errors.append(f"tool_timeout_overrides[{name!r}] must be a positive number")
+
+        valid_dup_modes = {"error", "warn", "ignore"}
+        if self.on_duplicate_task_id not in valid_dup_modes:
+            errors.append(
+                f"on_duplicate_task_id must be one of {sorted(valid_dup_modes)}"
+            )
 
         return errors
