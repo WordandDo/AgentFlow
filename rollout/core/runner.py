@@ -625,12 +625,15 @@ class AgentRunner:
             api_messages = [m.to_dict() for m in messages]
             
             # Get response from LLM (with per-attempt llm_timeout).
+            # Phase 0+ / commit 0.9: surface retry tuning from config.
             response = await async_chat_completion(
                 self.client,
                 model=self.config.model_name,
                 messages=api_messages,
                 tools=self.tool_schemas if self.tool_schemas else None,
                 max_retries=self.config.max_retries,
+                retry_wait=self.config.llm_retry_wait,
+                retry_backoff=self.config.llm_retry_backoff,
                 llm_timeout=self.config.llm_timeout,
             )
             
@@ -888,8 +891,9 @@ class AgentRunner:
         chat context, which both pollutes reasoning and wastes tokens).
         For tools without a registered formatter (custom/experimental)
         or for non-dict payloads, fall back to the generic
-        ``format_tool_result_for_message`` helper so trajectories never
-        stall on an unknown tool type.
+        ``format_tool_result_for_message`` helper (now length-bounded
+        by ``config.tool_result_max_length``; Phase 0+ / commit 0.9)
+        so trajectories never stall on an unknown tool type.
         """
         if isinstance(tool_result, dict):
             try:
@@ -908,7 +912,9 @@ class AgentRunner:
                     "falling back to generic formatter: %r",
                     tool_name, _ctx_trace(), e,
                 )
-        return format_tool_result_for_message(tool_result)
+        return format_tool_result_for_message(
+            tool_result, max_length=self.config.tool_result_max_length
+        )
 
 
 class SyncAgentRunner:

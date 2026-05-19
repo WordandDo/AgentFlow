@@ -139,6 +139,21 @@ class RolloutConfig:
     llm_max_connections: int = 256
     llm_max_keepalive: int = 64
 
+    # Phase 0+ / commit 0.9 (§13.5): per-LLM-call retry tuning
+    # surfaced from the previously-hard-coded `async_chat_completion`
+    # defaults. Kept distinct from the sandbox retry knobs because
+    # 5xx semantics differ between LLM gateways and the sandbox.
+    llm_retry_wait: float = 0.5
+    llm_retry_backoff: float = 2.0
+
+    # Maximum characters of a tool result that get fed back to the
+    # LLM. The Phase 0.4a `_format_for_llm` path delegates to the
+    # registered formatter; this knob still bounds the generic
+    # `format_tool_result_for_message` fallback (used for tools without
+    # a registered formatter). Raise on high-context models / long
+    # accessibility-tree dumps; lower for token-budget-tight runs.
+    tool_result_max_length: int = 4000
+
     # ---------------------------------------------------------------- #
     # Phase 2 worker-pool scheduling (commit 2.1).
     #
@@ -280,6 +295,9 @@ class RolloutConfig:
             "llm_connect_timeout": self.llm_connect_timeout,
             "llm_max_connections": self.llm_max_connections,
             "llm_max_keepalive": self.llm_max_keepalive,
+            "llm_retry_wait": self.llm_retry_wait,
+            "llm_retry_backoff": self.llm_retry_backoff,
+            "tool_result_max_length": self.tool_result_max_length,
             "tool_default_timeout": self.tool_default_timeout,
             "tool_timeout_overrides": self.tool_timeout_overrides,
             "on_duplicate_task_id": self.on_duplicate_task_id,
@@ -393,6 +411,14 @@ class RolloutConfig:
             errors.append("llm_max_keepalive must be >= 0")
         if self.llm_max_keepalive > self.llm_max_connections:
             errors.append("llm_max_keepalive must be <= llm_max_connections")
+        if self.llm_retry_wait < 0:
+            errors.append("llm_retry_wait must be >= 0")
+        if self.llm_retry_backoff < 1:
+            errors.append("llm_retry_backoff must be >= 1")
+        if self.tool_result_max_length < 256:
+            # 256 chars is a generous lower bound; below this the
+            # truncation marker eats almost the entire payload.
+            errors.append("tool_result_max_length must be >= 256")
         if self.tool_default_timeout <= 0:
             errors.append("tool_default_timeout must be positive")
         for name, value in (self.tool_timeout_overrides or {}).items():

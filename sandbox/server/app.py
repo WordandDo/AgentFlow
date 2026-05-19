@@ -63,6 +63,27 @@ from .routes import register_routes
 logger = logging.getLogger("HTTPServiceServer")
 
 
+def _derive_cleanup_interval(session_ttl: int) -> int:
+    """Derive the periodic cleanup scan interval from ``session_ttl``.
+
+    Phase 0+ / commit 0.9 (§13.5 / §13.6.4): callers configure only
+    ``session_ttl``; the server picks a sensible scan period:
+
+        cleanup_interval = max(30, min(300, session_ttl // 2))
+
+    - clamped low so short TTLs (tests with ttl=60) still get polled
+      twice per TTL;
+    - clamped high so a 30 min TTL doesn't go an hour without polling
+      (cleanup at 15 min is fine; 30 min would only catch expirations
+      ~30 min late).
+    """
+    try:
+        ttl = int(session_ttl)
+    except (TypeError, ValueError):
+        return 300
+    return max(30, min(300, ttl // 2))
+
+
 class HTTPServiceServer:
     """
     HTTP Service Server - Core server (holder + scheduler)
@@ -144,6 +165,13 @@ class HTTPServiceServer:
         # a flood of session creates returns 429+Retry-After instead of
         # piling up into an unbounded queue.
         self.backpressure: BackpressureManager = build_default_limiter(limits or {})
+
+        # Phase 0+ / commit 0.9 (§13.5 / §13.6.4): derive the periodic
+        # session-cleanup scan interval from `session_ttl` so users
+        # don't have to think about it. Cap to [30s, 300s] so very
+        # short TTLs still get reasonable polling and very long TTLs
+        # don't go unpolled for hours.
+        self.cleanup_interval: int = _derive_cleanup_interval(session_ttl)
         
         # ToolExecutor uses Server's data structure references
         # Use lambda to delay binding of ensure_backend_warmed_up method
@@ -555,7 +583,10 @@ class HTTPServiceServer:
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             logger.info("HTTP Service Server starting...")
-            logger.info("Session TTL configured: %ss", self.session_ttl)
+            logger.info(
+                "Session TTL configured: %ss, derived cleanup_interval: %ss",
+                self.session_ttl, self.cleanup_interval,
+            )
 
             # Execute warmup
             if self.warmup_resources:
@@ -590,8 +621,15 @@ class HTTPServiceServer:
             print("\nPress Ctrl+C to stop the server\n")
 
             async def cleanup_task():
+                # Phase 0+ / commit 0.9: use derived interval instead
+                # of hard-coded 300s. Captured at server build time so
+                # later runtime mutations of `self.cleanup_interval`
+                # don't take effect until the next server start (this
+                # is intentional - the scan period is part of the
+                # server's configuration, not a hot-reload knob).
+                interval = self.cleanup_interval
                 while True:
-                    await asyncio.sleep(300)
+                    await asyncio.sleep(interval)
                     cleaned = await self.resource_router.cleanup_expired()
                     if cleaned > 0:
                         logger.info(f"Cleaned {cleaned} expired sessions")

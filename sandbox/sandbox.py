@@ -129,6 +129,13 @@ class SandboxConfig:
     heartbeat_interval: float = 30.0
     heartbeat_jitter_ratio: float = 0.2
 
+    # Phase 0+ / commit 0.9 (§13.5): how long to wait on the bare
+    # `/health` GET when checking whether the server is online (used
+    # by `Sandbox.start()` and the `auto_start_server` polling loop).
+    # Was previously a hard-coded 5.0s; expose it for slow-start
+    # environments (server with heavy warmup, slow container init, ...).
+    server_online_check_timeout: float = 5.0
+
     def __post_init__(self):
         if not self.worker_id:
             self.worker_id = f"sandbox_{uuid.uuid4().hex[:8]}"
@@ -970,10 +977,17 @@ class Sandbox:
     # ========================================================================
     
     async def _check_server_online_async(self) -> bool:
-        """Check whether server is online"""
+        """Check whether server is online.
+
+        Phase 0+ / commit 0.9: the per-call timeout is now read from
+        `SandboxConfig.server_online_check_timeout` (was hard-coded
+        5.0s). Slow-start servers (heavy warmup, container init)
+        should bump this to avoid false "offline" readings.
+        """
         import httpx  # pyright: ignore[reportMissingImports]
+        timeout = float(getattr(self._config, "server_online_check_timeout", 5.0))
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.get(f"{self.server_url}/health")
                 return response.status_code == 200
         except Exception:
@@ -982,8 +996,9 @@ class Sandbox:
     def _check_server_online(self) -> bool:
         """Check whether server is online (sync)"""
         import httpx  # pyright: ignore[reportMissingImports]
+        timeout = float(getattr(self._config, "server_online_check_timeout", 5.0))
         try:
-            with httpx.Client(timeout=5.0) as client:
+            with httpx.Client(timeout=timeout) as client:
                 response = client.get(f"{self.server_url}/health")
                 return response.status_code == 200
         except Exception:

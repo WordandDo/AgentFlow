@@ -94,11 +94,18 @@ class ServerConfig:
     Server configuration
     
     Note: host and port are specified by Sandbox(server_url=...), not set in config file
+
+    `cleanup_interval` is kept on the dataclass for backward
+    compatibility with older JSON configs but is no longer consumed
+    by ``HTTPServiceServer``. Phase 0+ / commit 0.9 (§13.6.4): the
+    cleanup scan period is derived from ``session_ttl`` via
+    ``_derive_cleanup_interval``. Explicit user values are warned
+    about in the loader so the field is never silently inert.
     """
     title: str = "Sandbox HTTP Service"
     description: str = ""
     session_ttl: int = 300
-    cleanup_interval: int = 60
+    cleanup_interval: int = 60  # DEPRECATED; see class docstring.
     log_level: str = "INFO"
 
 
@@ -207,6 +214,19 @@ class ConfigLoader:
         
         # Server configuration (host/port specified by Sandbox(server_url=...))
         server_data = data.get("server", {})
+        # Phase 0+ / commit 0.9 (§13.6.4): cleanup_interval is now
+        # derived from session_ttl inside HTTPServiceServer. Explicit
+        # user values are kept on the dataclass for back-compat but
+        # warned about loudly so the loader never silently swallows
+        # them.
+        if "cleanup_interval" in server_data:
+            import logging as _logging
+            _logging.getLogger("ConfigLoader").warning(
+                "server.cleanup_interval=%s is DEPRECATED and IGNORED at runtime; "
+                "the cleanup scan period is now derived from session_ttl "
+                "(max(30, min(300, session_ttl // 2))). Remove the field to silence this warning.",
+                server_data.get("cleanup_interval"),
+            )
         server = ServerConfig(
             title=server_data.get("title", "Sandbox HTTP Service"),
             description=server_data.get("description", ""),
