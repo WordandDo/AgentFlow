@@ -16,7 +16,12 @@ import bdb
 from sandbox import Sandbox, format_tool_result
 
 from .config import RolloutConfig
-from .logging_utils import get_logger, set_context, clear_context
+from .logging_utils import get_context, get_logger, set_context, clear_context
+
+
+def _ctx_trace() -> str:
+    """Convenience helper: pull the current trace_id from the log context."""
+    return get_context().get("trace_id", "-")
 from .models import (
     BenchmarkItem, Trajectory, Message, ToolCall, TaskResult
 )
@@ -25,7 +30,7 @@ from .utils import (
     async_chat_completion,
     extract_final_answer,
     convert_tool_schema_to_openai,
-    format_tool_result_for_message
+    format_tool_result_for_message,  # kept as a fallback only
 )
 
 
@@ -371,7 +376,7 @@ class AgentRunner:
                             meta = {}
                         success = (code == 0) if code is not None else True
 
-                        result_text = format_tool_result_for_message(tool_result)
+                        result_text = self._format_for_llm(tool_name, tool_result)
 
                         tc = ToolCall(
                             tool_name=tool_name,
@@ -492,6 +497,35 @@ class AgentRunner:
         if tool_name in overrides:
             return float(overrides[tool_name])
         return float(self.config.tool_default_timeout)
+
+    def _format_for_llm(self, tool_name: str, tool_result: Any) -> str:
+        """Render a sandbox response into the string we send back to the LLM.
+
+        Prefer the canonical ``sandbox.format_tool_result`` registry so
+        the assistant sees the same human-friendly rendering everyone
+        else does (no `code`/`meta`/`trace_id` noise leaking into the
+        chat context, which both pollutes reasoning and wastes tokens).
+        For tools without a registered formatter (custom/experimental)
+        or for non-dict payloads, fall back to the generic
+        ``format_tool_result_for_message`` helper so trajectories never
+        stall on an unknown tool type.
+        """
+        if isinstance(tool_result, dict):
+            try:
+                return format_tool_result(tool_result)
+            except ValueError as e:
+                log.warning(
+                    "no formatter registered for tool %r (trace=%s): %s; "
+                    "falling back to generic formatter",
+                    tool_name, _ctx_trace(), e,
+                )
+            except Exception as e:
+                log.exception(
+                    "format_tool_result crashed for %r (trace=%s); "
+                    "falling back to generic formatter: %r",
+                    tool_name, _ctx_trace(), e,
+                )
+        return format_tool_result_for_message(tool_result)
 
 
 class SyncAgentRunner:
