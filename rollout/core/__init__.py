@@ -15,6 +15,7 @@ from .models import (
     RolloutSummary
 )
 from .evaluator import Evaluator, evaluate_results
+from .result_store import ResultStore, ResultStoreLockError
 from .utils import (
     create_openai_client,
     create_async_openai_client,
@@ -53,6 +54,10 @@ __all__ = [
     # Evaluator
     "Evaluator",
     "evaluate_results",
+
+    # Result store (Phase 3 / commit 3.1)
+    "ResultStore",
+    "ResultStoreLockError",
     
     # Utils
     "create_openai_client",

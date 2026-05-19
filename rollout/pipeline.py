@@ -29,6 +29,8 @@ from .core import (
     TaskResult,
     RolloutSummary,
     Evaluator,
+    ResultStore,
+    ResultStoreLockError,
     load_benchmark_data,
     get_timestamp
 )
@@ -78,15 +80,42 @@ class RolloutPipeline:
         
         # Create output directory
         os.makedirs(self.output_dir, exist_ok=True)
-        
-        # Initialize output files
-        timestamp = get_timestamp()
+
+        # Resolve output filenames (Phase 3 / commit 3.1).
+        #   "timestamp" (default): legacy results_<bench>_<ts>.jsonl.
+        #   "stable":   results_<bench>.jsonl (locked; supports resume).
+        #   "explicit": exactly `output_filename`.
+        # The evaluation/summary filenames piggy-back on the same stem
+        # so they're always co-located with the results file.
         benchmark_name = config.benchmark_name or "benchmark"
-        
-        self.results_file = os.path.join(self.output_dir, f"results_{benchmark_name}_{timestamp}.jsonl")
-        self.eval_file = os.path.join(self.output_dir, f"evaluation_{benchmark_name}_{timestamp}.json")
-        self.summary_file = os.path.join(self.output_dir, f"summary_{benchmark_name}_{timestamp}.json")
-        
+        timestamp = get_timestamp()
+        strategy = config.output_filename_strategy
+        if strategy == "explicit":
+            results_name = config.output_filename or f"results_{benchmark_name}.jsonl"
+            if not os.path.isabs(results_name):
+                self.results_file = os.path.join(self.output_dir, results_name)
+            else:
+                self.results_file = results_name
+            stem = self.results_file[:-len(".jsonl")] if self.results_file.endswith(".jsonl") else self.results_file
+            self.eval_file = stem + ".evaluation.json"
+            self.summary_file = stem + ".summary.json"
+        elif strategy == "stable":
+            base = f"results_{benchmark_name}"
+            self.results_file = os.path.join(self.output_dir, base + ".jsonl")
+            self.eval_file = os.path.join(self.output_dir, f"evaluation_{benchmark_name}.json")
+            self.summary_file = os.path.join(self.output_dir, f"summary_{benchmark_name}.json")
+        else:
+            # "timestamp" (default, backward-compat).
+            self.results_file = os.path.join(self.output_dir, f"results_{benchmark_name}_{timestamp}.jsonl")
+            self.eval_file = os.path.join(self.output_dir, f"evaluation_{benchmark_name}_{timestamp}.json")
+            self.summary_file = os.path.join(self.output_dir, f"summary_{benchmark_name}_{timestamp}.json")
+
+        # `_result_store` is created lazily inside run_async (it takes
+        # the cross-process fcntl lock then). Kept as a public-ish
+        # attribute so resume can iterate completed task_ids in tests
+        # and downstream tooling.
+        self._result_store: Optional[ResultStore] = ResultStore(self.results_file)
+
         print(f"💾 Output files:")
         print(f"   Results: {self.results_file}")
         if self.config.evaluate_results:
@@ -194,6 +223,23 @@ class RolloutPipeline:
             # Non-fatal: continue without signal handling (e.g. when run
             # inside a worker thread or notebook).
             log.warning("could not install ShutdownManager: %r", e)
+
+        # Phase 3 / commit 3.1: take the cross-process fcntl lock on
+        # the results file. For the legacy "timestamp" strategy this
+        # is essentially free (the file is fresh per run), but for
+        # "stable" / "explicit" + resume mode it prevents two rollout
+        # processes from interleaving bytes into the same file.
+        try:
+            assert self._result_store is not None
+            self._result_store.acquire_lock()
+        except ResultStoreLockError as e:
+            clear_context(ctx_tokens)
+            raise RuntimeError(
+                f"Cannot start rollout: results file is locked by another process "
+                f"({e}). If you are intentionally resuming the same file, stop the "
+                "other run first; otherwise change `output_filename_strategy` or "
+                "`output_filename`."
+            ) from e
 
         try:
             # Load benchmark
@@ -335,6 +381,13 @@ class RolloutPipeline:
 
             return summary
         finally:
+            # Release the cross-process file lock and clear the logging
+            # context regardless of success / failure / shutdown.
+            if self._result_store is not None:
+                try:
+                    self._result_store.release_lock()
+                except Exception as e:
+                    log.warning("ResultStore.release_lock failed: %r", e)
             clear_context(ctx_tokens)
 
     async def _run_sequential(self, runner: AgentRunner) -> None:
@@ -652,11 +705,22 @@ class RolloutPipeline:
             await asyncio.to_thread(self._append_line_sync, line)
 
     def _append_line_sync(self, line: str) -> None:
-        """Synchronous worker for _save_result; do not call from the loop."""
-        with open(self.results_file, 'a', encoding='utf-8') as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
+        """Synchronous worker for _save_result; do not call from the loop.
+
+        Delegates to the `ResultStore` so the flush/fsync semantics
+        live in one place (and so a future swap to a non-jsonl backend
+        is a one-line change).
+        """
+        if self._result_store is None:
+            # Defensive fallback - should not happen since __init__
+            # always builds a ResultStore - but keeps the write path
+            # working if someone overrides _result_store explicitly.
+            with open(self.results_file, 'a', encoding='utf-8') as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+            return
+        self._result_store.append_line(line)
 
     def run(self) -> RolloutSummary:
         """Run pipeline (sync wrapper)"""

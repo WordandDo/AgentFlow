@@ -99,6 +99,27 @@ class RolloutConfig:
     #     "ignore" -> no diagnostic, keep all rows
     on_duplicate_task_id: str = "error"
 
+    # Output filename strategy (Phase 3 / commit 3.1).
+    #   "timestamp" (default, backward-compat): the legacy
+    #       results_<bench>_<YYYYMMDD_HHMMSS>.jsonl naming. Each run
+    #       gets a unique file -> no need for resume.
+    #   "stable": results_<bench>.jsonl. Stable name, locked with
+    #       fcntl so two concurrent runs cannot interleave bytes.
+    #       Required for resume.
+    #   "explicit": use exactly `output_filename` (path relative to
+    #       output_dir, or absolute).
+    output_filename_strategy: str = "timestamp"
+    output_filename: Optional[str] = None
+
+    # Resume support (Phase 3 / commit 3.2). When `resume=True`, the
+    # pipeline reads existing rows from the results file and skips any
+    # task_id that is already present. `resume_retry_failed=True`
+    # (default) re-runs tasks that previously failed; setting it False
+    # skips them too.
+    resume: bool = False
+    resume_file: Optional[str] = None
+    resume_retry_failed: bool = True
+
     # Three-tier timeouts (Phase 0 / commit 0.5).
     # task: budget for a single benchmark task, including all LLM + tool calls.
     # llm:  budget for a single chat.completion request (per attempt).
@@ -262,6 +283,11 @@ class RolloutConfig:
             "tool_default_timeout": self.tool_default_timeout,
             "tool_timeout_overrides": self.tool_timeout_overrides,
             "on_duplicate_task_id": self.on_duplicate_task_id,
+            "output_filename_strategy": self.output_filename_strategy,
+            "output_filename": self.output_filename,
+            "resume": self.resume,
+            "resume_file": self.resume_file,
+            "resume_retry_failed": self.resume_retry_failed,
             # Worker pool (Phase 2 / commit 2.1).
             "concurrency": self.concurrency,
             "worker_startup_jitter": self.worker_startup_jitter,
@@ -377,6 +403,21 @@ class RolloutConfig:
         if self.on_duplicate_task_id not in valid_dup_modes:
             errors.append(
                 f"on_duplicate_task_id must be one of {sorted(valid_dup_modes)}"
+            )
+
+        valid_strategies = {"timestamp", "stable", "explicit"}
+        if self.output_filename_strategy not in valid_strategies:
+            errors.append(
+                f"output_filename_strategy must be one of {sorted(valid_strategies)}"
+            )
+        if self.output_filename_strategy == "explicit" and not self.output_filename:
+            errors.append(
+                "output_filename is required when output_filename_strategy='explicit'"
+            )
+        if self.resume and self.output_filename_strategy == "timestamp" and not self.resume_file:
+            errors.append(
+                "resume=True with output_filename_strategy='timestamp' is ambiguous: "
+                "either set output_filename_strategy='stable'/'explicit' or pass resume_file"
             )
 
         # Worker-pool fields (Phase 2 / commit 2.1).
