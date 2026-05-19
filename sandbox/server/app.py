@@ -48,7 +48,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .core import ResourceRouter, ToolExecutor, scan_tools
+from .core import (
+    ResourceRouter,
+    ToolExecutor,
+    scan_tools,
+    BackpressureManager,
+    build_default_limiter,
+)
 from .backends.base import Backend, BackendConfig
 from .routes import register_routes
 
@@ -83,7 +89,8 @@ class HTTPServiceServer:
         version: str = "1.0.0",
         enable_cors: bool = True,
         session_ttl: int = 300,
-        warmup_resources: Optional[List[str]] = None
+        warmup_resources: Optional[List[str]] = None,
+        limits: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize HTTP server
@@ -130,6 +137,13 @@ class HTTPServiceServer:
         
         self.session_ttl = session_ttl
         self.resource_router = ResourceRouter(session_ttl=session_ttl)
+
+        # Tiered backpressure (Phase 2S / commit 2S.2). Isolates
+        # /health and /status from /session:create and tool execution
+        # so a saturated lane cannot make liveness probes flap, and so
+        # a flood of session creates returns 429+Retry-After instead of
+        # piling up into an unbounded queue.
+        self.backpressure: BackpressureManager = build_default_limiter(limits or {})
         
         # ToolExecutor uses Server's data structure references
         # Use lambda to delay binding of ensure_backend_warmed_up method

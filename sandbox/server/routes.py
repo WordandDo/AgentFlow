@@ -24,6 +24,7 @@ from ..protocol import (
 )
 from .backends.error_codes import ErrorCode
 from .backends.response_builder import build_error_response, build_success_response
+from .core.backpressure import OverloadedError, overloaded_response
 
 if TYPE_CHECKING:
     from .app import HTTPServiceServer
@@ -41,70 +42,91 @@ def register_routes(app: FastAPI, server: "HTTPServiceServer"):
     """
     
     # ========== Health Endpoints ==========
-    
+    #
+    # The /health endpoint deliberately reads no shared state - it must
+    # stay green even while a slow tool lane is saturated, otherwise
+    # upstream load balancers will flap. /ready does touch the routing
+    # table so it shares the (larger) status lane.
+
     @app.get(HTTPEndpoints.HEALTH)
     async def health_check():
-        return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
-    
+        try:
+            async with server.backpressure.health.acquire_or_429(1.0):
+                return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+        except OverloadedError as e:
+            return overloaded_response(e)
+
     @app.get(HTTPEndpoints.READY)
     async def readiness_check():
-        all_sessions = await server.resource_router.list_all_sessions()
-        total_sessions = sum(len(s) for s in all_sessions.values())
-        return {
-            "status": "ready",
-            "tools_count": len(server._tools),
-            "active_workers": len(all_sessions),
-            "total_sessions": total_sessions
-        }
+        try:
+            async with server.backpressure.status.acquire_or_429(1.0):
+                all_sessions = await server.resource_router.list_all_sessions()
+                total_sessions = sum(len(s) for s in all_sessions.values())
+                return {
+                    "status": "ready",
+                    "tools_count": len(server._tools),
+                    "active_workers": len(all_sessions),
+                    "total_sessions": total_sessions
+                }
+        except OverloadedError as e:
+            return overloaded_response(e)
     
     # ========== Execute Endpoints ==========
     
     @app.post(HTTPEndpoints.EXECUTE)
     async def execute_action(request: ExecuteRequest):
         """Execute action"""
+        # Resolve the resource lane from the action prefix
+        # (e.g. "vm:click" -> "vm"). Falls back to the group default
+        # so unknown / un-prefixed tools still flow.
+        lane_key = request.get_resource_type()
         try:
-            # Build kwargs, including all runtime parameters
-            exec_kwargs = {
-                "worker_id": request.worker_id,
-                "timeout": request.timeout,
-            }
-            # If request contains trace_id, pass it in
-            if hasattr(request, "trace_id") and request.trace_id:
-                exec_kwargs["trace_id"] = request.trace_id
-            
-            result = await server.execute(
-                action=request.action,
-                params=request.params,
-                **exec_kwargs
-            )
-            code = result.get("code", ErrorCode.UNEXPECTED_ERROR)
-            if code == ErrorCode.SUCCESS:
-                status_code = 200
-            elif 4000 <= int(code) < 5000:
-                status_code = 400
-            else:
-                status_code = 500
-                logger.error(
-                    "Execute action returned 500: code=%s tool=%s message=%s data=%s",
-                    code,
-                    result.get("tool"),
-                    result.get("message"),
-                    result.get("data"),
-                )
-            return JSONResponse(status_code=status_code, content=result)
-        except Exception as e:
-            import traceback
-            logger.error(f"Execute action failed: {e}\n{traceback.format_exc()}")
-            error_response = build_error_response(
-                code=ErrorCode.UNEXPECTED_ERROR,
-                message=str(e),
-                tool=request.action,
-                data={"traceback": traceback.format_exc()}
-            )
-            return JSONResponse(
-                status_code=500,
-                content=error_response
-            )
+            async with server.backpressure.tool.get(lane_key).acquire_or_429(1.0):
+                try:
+                    # Build kwargs, including all runtime parameters
+                    exec_kwargs = {
+                        "worker_id": request.worker_id,
+                        "timeout": request.timeout,
+                    }
+                    # If request contains trace_id, pass it in
+                    if hasattr(request, "trace_id") and request.trace_id:
+                        exec_kwargs["trace_id"] = request.trace_id
+
+                    result = await server.execute(
+                        action=request.action,
+                        params=request.params,
+                        **exec_kwargs
+                    )
+                    code = result.get("code", ErrorCode.UNEXPECTED_ERROR)
+                    if code == ErrorCode.SUCCESS:
+                        status_code = 200
+                    elif 4000 <= int(code) < 5000:
+                        status_code = 400
+                    else:
+                        status_code = 500
+                        logger.error(
+                            "Execute action returned 500: code=%s tool=%s message=%s data=%s",
+                            code,
+                            result.get("tool"),
+                            result.get("message"),
+                            result.get("data"),
+                        )
+                    return JSONResponse(status_code=status_code, content=result)
+                except Exception as e:
+                    import traceback
+                    logger.error(f"Execute action failed: {e}\n{traceback.format_exc()}")
+                    error_response = build_error_response(
+                        code=ErrorCode.UNEXPECTED_ERROR,
+                        message=str(e),
+                        tool=request.action,
+                        data={"traceback": traceback.format_exc()}
+                    )
+                    return JSONResponse(
+                        status_code=500,
+                        content=error_response
+                    )
+        except OverloadedError as e:
+            return overloaded_response(e)
     
     @app.post(HTTPEndpoints.EXECUTE_BATCH)
     async def execute_batch(request: ExecuteBatchRequest):
@@ -272,63 +294,75 @@ def register_routes(app: FastAPI, server: "HTTPServiceServer"):
             )
             return JSONResponse(status_code=400, content=response)
 
-        existing = await server.resource_router.get_session(worker_id, resource_type)
-        if existing:
-            response = build_success_response(
-                data={
-                    "status": "exists",
-                    "session_id": existing.get("session_id"),
-                    "session_name": existing.get("session_name"),
-                    "resource_type": resource_type
-                },
-                tool="session:create",
-                execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
-                resource_type="session",
-                session_id=existing.get("session_id")
-            )
-            return JSONResponse(content=response)
+        # session_create is the scarce lane (VM/Browser inits are slow);
+        # acquire its per-resource_type bound BEFORE doing any expensive
+        # work so a flood for the same resource_type fails fast with
+        # 429+Retry-After instead of stacking up into an unbounded queue.
+        try:
+            async with server.backpressure.session_create.get(
+                resource_type
+            ).acquire_or_429(1.0):
+                existing = await server.resource_router.get_session(
+                    worker_id, resource_type
+                )
+                if existing:
+                    response = build_success_response(
+                        data={
+                            "status": "exists",
+                            "session_id": existing.get("session_id"),
+                            "session_name": existing.get("session_name"),
+                            "resource_type": resource_type
+                        },
+                        tool="session:create",
+                        execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
+                        resource_type="session",
+                        session_id=existing.get("session_id")
+                    )
+                    return JSONResponse(content=response)
 
-        session_info = await server.resource_router.get_or_create_session(
-            worker_id=worker_id,
-            resource_type=resource_type,
-            config=session_config,
-            auto_created=False,
-            custom_name=custom_name
-        )
+                session_info = await server.resource_router.get_or_create_session(
+                    worker_id=worker_id,
+                    resource_type=resource_type,
+                    config=session_config,
+                    auto_created=False,
+                    custom_name=custom_name
+                )
 
-        data_payload = {
-            "session_id": session_info.get("session_id"),
-            "session_name": session_info.get("session_name"),
-            "resource_type": resource_type,
-            "session_status": session_info.get("status"),
-            "error": session_info.get("error")
-        }
+                data_payload = {
+                    "session_id": session_info.get("session_id"),
+                    "session_name": session_info.get("session_name"),
+                    "resource_type": resource_type,
+                    "session_status": session_info.get("status"),
+                    "error": session_info.get("error")
+                }
 
-        # Add compatibility mode information
-        if session_info.get("compatibility_mode"):
-            data_payload["compatibility_mode"] = True
-            data_payload["compatibility_message"] = session_info.get("compatibility_message")
+                # Add compatibility mode information
+                if session_info.get("compatibility_mode"):
+                    data_payload["compatibility_mode"] = True
+                    data_payload["compatibility_message"] = session_info.get("compatibility_message")
 
-        if session_info.get("status") == "active":
-            response = build_success_response(
-                data=data_payload,
-                tool="session:create",
-                execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
-                resource_type="session",
-                session_id=session_info.get("session_id")
-            )
-            return JSONResponse(content=response)
+                if session_info.get("status") == "active":
+                    response = build_success_response(
+                        data=data_payload,
+                        tool="session:create",
+                        execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
+                        resource_type="session",
+                        session_id=session_info.get("session_id")
+                    )
+                    return JSONResponse(content=response)
 
-        response = build_error_response(
-            code=ErrorCode.RESOURCE_NOT_INITIALIZED,
-            message="Session creation failed",
-            tool="session:create",
-            data=data_payload,
-            execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
-            resource_type="session",
-            session_id=session_info.get("session_id")
-        )
-        return JSONResponse(status_code=500, content=response)
+                response = build_error_response(
+                    code=ErrorCode.RESOURCE_NOT_INITIALIZED,
+                    message="Session creation failed",
+                    tool="session:create",
+                    data=data_payload,
+                    execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
+                    resource_type="session",
+                    session_id=session_info.get("session_id")
+                )
+                return JSONResponse(status_code=500, content=response)
+        except OverloadedError as e:
+            return overloaded_response(e)
     
     @app.post(HTTPEndpoints.SESSION_DESTROY)
     async def destroy_session(request: Request):
