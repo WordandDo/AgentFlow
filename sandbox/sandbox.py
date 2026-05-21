@@ -117,6 +117,9 @@ class SandboxConfig:
     
     # Other settings
     retry_count: int = 3
+    retry_delay: float = 1.0
+    retry_backoff: float = 2.0
+    retry_jitter: float = 0.3
     log_level: str = "INFO"
 
     # Phase 2S / commit 0.4b (ENG-22): make heartbeat behaviour
@@ -1227,6 +1230,9 @@ server.run()
             base_url=self._config.server_url,
             timeout=self._config.timeout,
             max_retries=self._config.retry_count,
+            retry_delay=self._config.retry_delay,
+            retry_backoff=self._config.retry_backoff,
+            retry_jitter=self._config.retry_jitter,
             worker_id=self._config.worker_id,
             # Phase 2S / commit 0.4b: forward the SandboxConfig
             # heartbeat knobs so callers (rollout, tests, ad-hoc users)

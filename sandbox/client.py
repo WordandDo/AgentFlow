@@ -58,6 +58,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("HTTPServiceClient")
 
 
+def _parse_retry_after(value: Optional[str]) -> float:
+    """Return a non-negative Retry-After delay in seconds, or 0 if absent."""
+    if value is None:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # ============================================================================
 # Client Configuration
 # ============================================================================
@@ -318,6 +328,7 @@ class HTTPServiceClient:
         last_err: Optional[HTTPClientError] = None
 
         for attempt in range(max_attempts):
+            server_retry_after = 0.0
             try:
                 if method.upper() == "GET":
                     response = await self._client.get(endpoint, timeout=request_timeout)
@@ -350,6 +361,11 @@ class HTTPServiceClient:
                 if 400 <= response.status_code < 500 and response.status_code != 429:
                     raise err
                 # 5xx / 429: retryable.
+                if response.status_code == 429:
+                    headers = getattr(response, "headers", {})
+                    server_retry_after = _parse_retry_after(
+                        headers.get("Retry-After") if headers else None
+                    )
                 last_err = err
 
             except HTTPClientError:
@@ -367,7 +383,10 @@ class HTTPServiceClient:
             base = self.config.retry_delay * (self.config.retry_backoff ** attempt)
             jitter_lo = max(0.0, 1.0 - self.config.retry_jitter)
             jitter_hi = max(jitter_lo, 1.0 + self.config.retry_jitter)
-            wait = base * random.uniform(jitter_lo, jitter_hi)
+            wait = max(
+                base * random.uniform(jitter_lo, jitter_hi),
+                server_retry_after,
+            )
             logger.warning(
                 "request %s %s failed (attempt %d/%d): %s; retry in %.2fs",
                 method, endpoint, attempt + 1, max_attempts,

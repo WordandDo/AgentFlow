@@ -33,6 +33,8 @@ import pytest
 
 from sandbox.client import HTTPClientConfig, HTTPServiceClient, HTTPClientError
 from sandbox.sandbox import Sandbox, SandboxConfig
+from sandbox.protocol import HTTPEndpoints
+from sandbox.server.app import HTTPServiceServer
 from sandbox.server.core.backpressure import (
     Bound,
     LaneGroup,
@@ -107,6 +109,34 @@ async def test_resource_router_singleflight_dedups_concurrent_callers():
     assert len(ids) == 1, ids
 
 
+@async_test
+async def test_resource_router_leader_cancel_unblocks_singleflight_followers():
+    """If the singleflight leader is cancelled during init, followers must not hang."""
+    router = ResourceRouter(session_ttl=60)
+    entered = asyncio.Event()
+
+    async def blocking_vm(_worker_id, _config):
+        entered.set()
+        await asyncio.sleep(10)
+        return {"booted": True}
+
+    router.register_resource_type("vm", initializer=blocking_vm)
+    leader = asyncio.create_task(router.get_or_create_session("w1", "vm"))
+    await entered.wait()
+
+    follower = asyncio.create_task(router.get_or_create_session("w1", "vm"))
+    await asyncio.sleep(0.05)
+
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(follower, timeout=0.5)
+
+    assert ("w1", "vm") not in router._initializing
+    assert await router.get_session("w1", "vm") is None
+
+
 # -----------------------------------------------------------------------
 # Commit 2S.2 - Backpressure Bound / LaneGroup / OverloadedError
 # -----------------------------------------------------------------------
@@ -161,6 +191,92 @@ def test_build_default_limiter_has_expected_lanes():
     assert mgr.tool.get("rag").capacity > 1
     # Unknown lane key -> falls back to default.
     assert mgr.tool.get("does-not-exist").name == "tool.default"
+
+
+def test_sandbox_retry_knobs_forward_to_http_client_config():
+    sandbox = Sandbox(config=SandboxConfig(
+        server_url="http://stub",
+        retry_count=5,
+        retry_delay=0.25,
+        retry_backoff=3.0,
+        retry_jitter=0.4,
+        auto_heartbeat=False,
+    ))
+    sandbox._create_client()
+
+    assert sandbox.client is not None
+    assert sandbox.client.config.max_retries == 5
+    assert sandbox.client.config.retry_delay == 0.25
+    assert sandbox.client.config.retry_backoff == 3.0
+    assert sandbox.client.config.retry_jitter == 0.4
+
+
+@async_test
+async def test_agent_runner_forwards_rollout_sandbox_retry_config(monkeypatch):
+    import rollout.core.runner as runner_mod
+    from rollout.core.config import RolloutConfig
+
+    captured = {}
+
+    class FakeSandbox:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def start(self):
+            return None
+
+    async def fake_load_tool_schemas(self):
+        return None
+
+    monkeypatch.setattr(runner_mod, "Sandbox", FakeSandbox)
+    monkeypatch.setattr(runner_mod.AgentRunner, "_load_tool_schemas", fake_load_tool_schemas)
+
+    cfg = RolloutConfig(
+        api_key="sk-test",
+        base_url="http://example.test/v1",
+        sandbox_retry_max=7,
+        sandbox_retry_backoff_base=0.5,
+        sandbox_retry_jitter=0.25,
+    )
+    runner = runner_mod.AgentRunner(cfg, worker_id="w-retry")
+    assert await runner.start() is True
+
+    assert captured["retry_count"] == 7
+    assert captured["retry_delay"] == 0.5
+    assert captured["retry_jitter"] == 0.25
+
+
+def test_global_backpressure_middleware_rejects_data_plane():
+    class RejectingBound:
+        def acquire_or_429(self, retry_after_s=1.0):
+            class CM:
+                async def __aenter__(self_inner):
+                    raise OverloadedError(
+                        lane="global_inflight",
+                        retry_after_s=retry_after_s,
+                        waiters=1,
+                        queue_max=1,
+                    )
+
+                async def __aexit__(self_inner, exc_type, exc, tb):
+                    return False
+
+            return CM()
+
+    server = HTTPServiceServer(enable_cors=False)
+    server.backpressure.global_inflight = RejectingBound()  # type: ignore[assignment]
+    app = server.create_app()
+
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+    resp = client.post(HTTPEndpoints.EXECUTE, json={
+        "worker_id": "w1",
+        "action": "echo",
+        "params": {},
+    })
+
+    assert resp.status_code == 429
+    assert resp.headers["retry-after"] == "1"
 
 
 # -----------------------------------------------------------------------
@@ -315,9 +431,10 @@ async def test_refresh_session_returns_false_for_unknown():
 
 
 class _FakeResponse:
-    def __init__(self, status: int, body: dict):
+    def __init__(self, status: int, body: dict, headers=None):
         self.status_code = status
         self._body = body
+        self.headers = headers or {}
     def json(self):
         return self._body
 
@@ -377,6 +494,25 @@ async def test_client_429_is_retryable():
     out = await client._request("POST", "/api/v1/execute", data={"x": 1})
     assert out["code"] == 0
     assert http.calls == 2
+
+
+@async_test
+async def test_client_429_respects_retry_after_header(monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    http = _ScriptedHttpx([
+        _FakeResponse(429, {"message": "slow down"}, headers={"Retry-After": "2"}),
+        _FakeResponse(200, {"code": 0, "data": {}}),
+    ])
+    client = _build_client(http)
+    out = await client._request("POST", "/api/v1/execute", data={"x": 1})
+
+    assert out["code"] == 0
+    assert sleeps == [2.0]
 
 
 @async_test

@@ -53,10 +53,13 @@ from .core import (
     ToolExecutor,
     scan_tools,
     BackpressureManager,
+    OverloadedError,
     build_default_limiter,
+    overloaded_response,
 )
 from .backends.base import Backend, BackendConfig
 from .routes import register_routes
+from ..protocol import HTTPEndpoints
 
 # Import protocol for endpoints
 
@@ -695,6 +698,32 @@ class HTTPServiceServer:
             version=self.version,
             lifespan=lifespan
         )
+
+        global_backpressure_paths = {
+            HTTPEndpoints.HEARTBEAT,
+            HTTPEndpoints.EXECUTE,
+            HTTPEndpoints.EXECUTE_BATCH,
+            HTTPEndpoints.SESSION_CREATE,
+            HTTPEndpoints.SESSION_DESTROY,
+            HTTPEndpoints.SESSION_LIST,
+            HTTPEndpoints.SESSION_REFRESH,
+            HTTPEndpoints.INIT_RESOURCE,
+            HTTPEndpoints.INIT_BATCH,
+            HTTPEndpoints.INIT_FROM_CONFIG,
+            HTTPEndpoints.WARMUP,
+            HTTPEndpoints.SHUTDOWN,
+            "/api/v1/worker/disconnect",
+        }
+
+        @app.middleware("http")
+        async def global_backpressure_middleware(request, call_next):
+            if request.url.path not in global_backpressure_paths:
+                return await call_next(request)
+            try:
+                async with self.backpressure.global_inflight.acquire_or_429(1.0):
+                    return await call_next(request)
+            except OverloadedError as exc:
+                return overloaded_response(exc)
         
         if self.enable_cors:
             app.add_middleware(

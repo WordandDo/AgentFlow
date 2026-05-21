@@ -10,8 +10,6 @@ import os
 import json
 import http.client
 import asyncio
-import asyncio
-import logging
 import threading
 import time
 from typing import Dict, Any, List, Union, Optional

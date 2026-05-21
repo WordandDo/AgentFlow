@@ -18,11 +18,6 @@ from sandbox import Sandbox, format_tool_result
 from .config import RolloutConfig
 from .checkpoint_store import CheckpointStore
 from .logging_utils import get_context, get_logger, set_context, clear_context
-
-
-def _ctx_trace() -> str:
-    """Convenience helper: pull the current trace_id from the log context."""
-    return get_context().get("trace_id", "-")
 from .models import (
     BenchmarkItem, Trajectory, Message, ToolCall, TaskResult
 )
@@ -36,6 +31,11 @@ from .utils import (
 
 
 log = get_logger("rollout.runner")
+
+
+def _ctx_trace() -> str:
+    """Convenience helper: pull the current trace_id from the log context."""
+    return get_context().get("trace_id", "-")
 
 
 def _make_trace_id(run_id: str, worker_id: str, task_id: str, turn: int, suffix: str) -> str:
@@ -351,6 +351,9 @@ class AgentRunner:
                 auto_start_server=self.config.sandbox_auto_start,
                 server_config_path=self.config.sandbox_config_path,
                 timeout=self.config.sandbox_timeout,
+                retry_count=self.config.sandbox_retry_max,
+                retry_delay=self.config.sandbox_retry_backoff_base,
+                retry_jitter=self.config.sandbox_retry_jitter,
                 warmup_resources=self.config.resource_types if self.config.resource_types else None
             )
             

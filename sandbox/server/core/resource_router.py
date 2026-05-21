@@ -287,45 +287,54 @@ class ResourceRouter:
             "custom_name": normalized_custom,
         }
 
-        if resource_type in self._resource_initializers:
-            try:
-                initializer = self._resource_initializers[resource_type]
-                if asyncio.iscoroutinefunction(initializer):
-                    init_result = await initializer(worker_id, init_config)
-                else:
-                    # Off-load the sync initializer to a worker thread so
-                    # CPU/blocking init does not steal time from the
-                    # event loop while we hold no locks.
-                    init_result = await asyncio.to_thread(
-                        initializer, worker_id, init_config
+        try:
+            if resource_type in self._resource_initializers:
+                try:
+                    initializer = self._resource_initializers[resource_type]
+                    if asyncio.iscoroutinefunction(initializer):
+                        init_result = await initializer(worker_id, init_config)
+                    else:
+                        # Off-load the sync initializer to a worker thread so
+                        # CPU/blocking init does not steal time from the
+                        # event loop while we hold no locks.
+                        init_result = await asyncio.to_thread(
+                            initializer, worker_id, init_config
+                        )
+                    if init_result:
+                        session_info["data"].update(init_result)
+                    session_info["status"] = "active"
+                except Exception as e:
+                    logger.error(
+                        f"[{worker_id}] Resource init failed: {resource_type} - {e}"
                     )
-                if init_result:
-                    session_info["data"].update(init_result)
+                    session_info["status"] = "error"
+                    session_info["error"] = str(e)
+            else:
                 session_info["status"] = "active"
-            except Exception as e:
-                logger.error(
-                    f"[{worker_id}] Resource init failed: {resource_type} - {e}"
+                session_info["compatibility_mode"] = True
+                session_info["compatibility_message"] = (
+                    f"Resource type '{resource_type}' does not require session initialization. "
+                    f"This session was created for compatibility but no initialization was performed."
                 )
-                session_info["status"] = "error"
-                session_info["error"] = str(e)
-        else:
-            session_info["status"] = "active"
-            session_info["compatibility_mode"] = True
-            session_info["compatibility_message"] = (
-                f"Resource type '{resource_type}' does not require session initialization. "
-                f"This session was created for compatibility but no initialization was performed."
-            )
 
-        # ---- Step 3: publish result under the metadata lock. ---------
-        async with self._lock:
-            if session_info.get("status") == "active":
-                self._routes.setdefault(worker_id, {})[resource_type] = session_info
-            # Clear the singleflight slot and wake any pending waiters.
-            cur = self._initializing.get(key)
-            if cur is leader_fut:
-                self._initializing.pop(key, None)
-            if not leader_fut.done():
-                leader_fut.set_result(session_info)
+            # ---- Step 3: publish result under the metadata lock. ---------
+            async with self._lock:
+                if session_info.get("status") == "active":
+                    self._routes.setdefault(worker_id, {})[resource_type] = session_info
+                # Clear the singleflight slot and wake any pending waiters.
+                cur = self._initializing.get(key)
+                if cur is leader_fut:
+                    self._initializing.pop(key, None)
+                if not leader_fut.done():
+                    leader_fut.set_result(session_info)
+        except asyncio.CancelledError:
+            async with self._lock:
+                cur = self._initializing.get(key)
+                if cur is leader_fut:
+                    self._initializing.pop(key, None)
+                if not leader_fut.done():
+                    leader_fut.cancel()
+            raise
 
         # Log outside the lock to keep the critical section minimal.
         create_mode = "AUTO-CREATED" if auto_created else "CREATED"
