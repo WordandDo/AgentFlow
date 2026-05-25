@@ -70,6 +70,29 @@ def register_routes(app: FastAPI, server: "HTTPServiceServer"):
                 }
         except OverloadedError as e:
             return overloaded_response(e)
+
+    @app.get("/api/v1/server/status")
+    async def server_status():
+        """Server-wide status for operators and load-test probes."""
+        try:
+            async with server.backpressure.status.acquire_or_429(1.0):
+                all_sessions = await server.resource_router.list_all_sessions()
+                total_sessions = sum(len(s) for s in all_sessions.values())
+                response = build_success_response(
+                    data={
+                        "status": "ready",
+                        "tools_count": len(server._tools),
+                        "active_workers": len(all_sessions),
+                        "active_sessions": total_sessions,
+                        "total_sessions": total_sessions,
+                        "backpressure": server.backpressure.snapshot(),
+                    },
+                    tool="server:status",
+                    resource_type="server",
+                )
+                return JSONResponse(content=response)
+        except OverloadedError as e:
+            return overloaded_response(e)
     
     # ========== Execute Endpoints ==========
     

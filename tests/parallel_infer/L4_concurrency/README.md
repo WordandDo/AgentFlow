@@ -14,18 +14,22 @@ cp configs/infer/rag_infer.parallel.json /tmp/rag.json
 jq '.concurrency = 100 | .number_of_tasks = 500' \
    configs/infer/rag_infer.parallel.json > /tmp/rag.json
 
-bash start_sandbox_server.sh &
+bash start_sandbox_server.sh --config configs/sandbox-server/rag_config.json &
 export OPENAI_API_KEY=...
 export OPENAI_BASE_URL=...
 
-python infer.py --config /tmp/rag.json --output-dir /tmp/rag_out
+python -m rollout.pipeline --config /tmp/rag.json \
+    --api-key "$OPENAI_API_KEY" \
+    --base-url "$OPENAI_BASE_URL" \
+    --output-dir /tmp/rag_out \
+    --no-eval
 ```
 
 ## 同步运行 `load_test.py`（数据面探针）
 
 ```bash
 python tests/parallel_infer/L4_concurrency/load_test.py \
-    --base-url http://127.0.0.1:8080 \
+    --base-url http://127.0.0.1:18890 \
     --workers 100 --duration 30 \
     --resource-type rag --tool rag:search
 ```
@@ -35,7 +39,7 @@ python tests/parallel_infer/L4_concurrency/load_test.py \
 
 ## 通过判据
 
-### `python infer.py` 跑完后
+### `python -m rollout.pipeline` 跑完后
 
 - `len(results.jsonl) == number_of_tasks`
 - `tool_stats.success_rate >= 0.9`
@@ -54,7 +58,7 @@ python tests/parallel_infer/L4_concurrency/load_test.py \
 ## 失败时如何排查
 
 1. **服务端 502 / connection refused 集中爆发** → `global_inflight` 太小，
-   或 OS 句柄不够；`ulimit -n 65535 && bash start_sandbox_server.sh`。
+   或 OS 句柄不够；`ulimit -n 65535 && bash start_sandbox_server.sh --config configs/sandbox-server/rag_config.json`。
 2. **大量 5xx + client 反复重试** → backpressure 没正确分流；检查
    `BackpressureManager.global_inflight` 是否被 routes 引用。
 3. **某个 worker 卡死 N 分钟** → 长任务 + 没设置 `task_max_seconds`；

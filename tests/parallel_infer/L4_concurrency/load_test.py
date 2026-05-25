@@ -11,7 +11,7 @@ rejections at the end.
 Use this to load-test the *server* without burning LLM tokens:
 
     python tests/parallel_infer/L4_concurrency/load_test.py \\
-        --base-url http://127.0.0.1:8080 \\
+        --base-url http://127.0.0.1:18890 \\
         --workers 100 --duration 30 \\
         --resource-type rag --tool rag:search
 """
@@ -145,7 +145,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default="http://127.0.0.1:8080")
+    parser.add_argument("--base-url", default="http://127.0.0.1:18890")
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--duration", type=float, default=10.0)
     parser.add_argument("--resource-type", default="rag")

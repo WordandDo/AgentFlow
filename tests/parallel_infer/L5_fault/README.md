@@ -9,7 +9,7 @@
 ## 准备
 
 ```bash
-bash start_sandbox_server.sh &
+bash start_sandbox_server.sh --config configs/sandbox-server/rag_config.json &
 SERVER_PID=$!
 export OPENAI_API_KEY=... OPENAI_BASE_URL=...
 ```
@@ -18,9 +18,11 @@ export OPENAI_API_KEY=... OPENAI_BASE_URL=...
 
 ```bash
 # 起一个不会立刻结束的任务（比如 100 个 task）
-python infer.py --config configs/infer/rag_infer.parallel.json \
+python -m rollout.pipeline --config configs/infer/rag_infer.parallel.json \
+    --api-key "$OPENAI_API_KEY" \
+    --base-url "$OPENAI_BASE_URL" \
     --output-dir /tmp/fault_ctrlc \
-    --max-tasks 100 --parallel --max-workers 10 &
+    --max-tasks 100 --parallel --max-workers 10 --no-eval &
 INF_PID=$!
 sleep 8
 kill -INT "$INF_PID"   # 第一次 Ctrl+C
@@ -36,7 +38,7 @@ wait "$INF_PID"
 ## 场景 2：连按 3 次 Ctrl+C（force exit）
 
 ```bash
-python infer.py ... &
+python -m rollout.pipeline ... &
 INF_PID=$!
 sleep 5
 kill -INT "$INF_PID"; sleep 0.5
@@ -53,7 +55,7 @@ wait "$INF_PID" || echo "exit code: $?"
 ## 场景 3：kill -9 跑到一半的 rollout
 
 ```bash
-python infer.py ... --checkpoint-enabled &
+python -m rollout.pipeline ... --checkpoint-enabled &
 INF_PID=$!
 sleep 10
 kill -9 "$INF_PID"
@@ -72,7 +74,8 @@ kill -9 "$INF_PID"
 通过判据：
 - 第 1 个 worker 等 ~30s 拿到 session；其余 9 个 worker 几乎立刻拿到（因为
   ResourceRouter.split lock）。
-- 在那 30s 内，对 server 打 `curl /health` / `/api/v1/server/status` 应在 50ms
+- 在那 30s 内，对 server 打 `curl http://127.0.0.1:18890/health` /
+  `curl http://127.0.0.1:18890/api/v1/server/status` 应在 50ms
   内返回 200（因为长 init 已经在锁外完成）。
 
 ## 场景 5：网络抖动
@@ -98,7 +101,7 @@ python -c "from rollout.core.result_store import ResultStore; \
     import time; time.sleep(60)"
 
 # 终端 B：
-python infer.py --config ... --output-dir /tmp \
+python -m rollout.pipeline --config ... --output-dir /tmp \
     --output-filename locked.jsonl  # 同一文件
 ```
 

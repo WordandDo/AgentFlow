@@ -857,6 +857,10 @@ def main():
                        help="Output directory (overrides config)")
     parser.add_argument("--model", type=str, default=None,
                        help="Model name (overrides config)")
+    parser.add_argument("--api-key", type=str, default=None,
+                       help="LLM API key (overrides config; defaults to OPENAI_API_KEY if config is empty)")
+    parser.add_argument("--base-url", type=str, default=None,
+                       help="LLM API base URL (overrides config; defaults to OPENAI_BASE_URL if config is empty)")
     parser.add_argument("--max-tasks", type=int, default=None,
                        help="Maximum number of tasks to run")
     parser.add_argument("--task-ids", type=str, nargs="+", default=None,
@@ -867,6 +871,12 @@ def main():
                        help="Run tasks in parallel")
     parser.add_argument("--max-workers", type=int, default=None,
                        help="Maximum parallel workers")
+    parser.add_argument("--checkpoint-enabled", action="store_true",
+                       help="Write mid-task checkpoints during rollout")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                       help="Checkpoint directory (defaults under output-dir)")
+    parser.add_argument("--output-filename", type=str, default=None,
+                       help="Explicit results filename (relative to output-dir or absolute)")
     parser.add_argument("--metric", type=str, default=None,
                        choices=["exact_match", "f1_score", "contains_answer", "numeric_match", "llm_judgement", "DocBench_LasJ", "MMLongBench-Doc_LasJ", "MMLongBench-Doc_F1", "MMLongBench-Doc_Acc"],
                        help="Evaluation metric (overrides config)")
@@ -887,6 +897,14 @@ def main():
         config.data_path = args.data
     if args.model:
         config.model_name = args.model
+    if args.api_key:
+        config.api_key = args.api_key
+    elif not config.api_key:
+        config.api_key = os.environ.get("OPENAI_API_KEY", "")
+    if args.base_url:
+        config.base_url = args.base_url
+    elif not config.base_url:
+        config.base_url = os.environ.get("OPENAI_BASE_URL", "")
     if args.max_tasks:
         config.number_of_tasks = args.max_tasks
     if args.task_ids:
@@ -897,6 +915,14 @@ def main():
         config.parallel = True
     if args.max_workers:
         config.max_workers = args.max_workers
+        config.concurrency = args.max_workers
+    if args.checkpoint_enabled:
+        config.checkpoint_enabled = True
+    if args.checkpoint_dir:
+        config.checkpoint_dir = args.checkpoint_dir
+    if args.output_filename:
+        config.output_filename_strategy = "explicit"
+        config.output_filename = args.output_filename
     if args.metric:
         config.evaluation_metric = args.metric
     

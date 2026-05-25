@@ -21,9 +21,15 @@ if [[ ! -f "$CONFIG" ]]; then
 fi
 
 # Sanity check: sandbox server is up.
-if ! curl -sf http://127.0.0.1:8080/health >/dev/null 2>&1; then
-    echo "[L3] sandbox server not reachable at http://127.0.0.1:8080/health" >&2
-    echo "[L3] hint: bash $REPO_ROOT/start_sandbox_server.sh" >&2
+SANDBOX_URL="${SANDBOX_URL:-http://127.0.0.1:18890}"
+case "$SCENARIO" in
+    web) SANDBOX_CONFIG_HINT="configs/sandbox-server/web_config.json" ;;
+    gui) SANDBOX_CONFIG_HINT="configs/sandbox-server/GUI_config.json" ;;
+    *) SANDBOX_CONFIG_HINT="configs/sandbox-server/rag_config.json" ;;
+esac
+if ! curl -sf "$SANDBOX_URL/health" >/dev/null 2>&1; then
+    echo "[L3] sandbox server not reachable at $SANDBOX_URL/health" >&2
+    echo "[L3] hint: bash $REPO_ROOT/start_sandbox_server.sh --config $SANDBOX_CONFIG_HINT" >&2
     exit 3
 fi
 
@@ -36,14 +42,17 @@ fi
 OUT_DIR="$HERE/.last_smoke_${SCENARIO}"
 mkdir -p "$OUT_DIR"
 
-PY="${PYTHON:-/home/yanguochen/miniconda3/envs/af/bin/python}"
+PY="${PYTHON:-python}"
 
-# We override `number_of_tasks` to 3 via env -> infer.py honours it.
+# Keep the mini-run small even when the sample config is tuned for high concurrency.
 cd "$REPO_ROOT"
-$PY infer.py \
+$PY -m rollout.pipeline \
     --config "$CONFIG" \
+    --api-key "$OPENAI_API_KEY" \
+    --base-url "$OPENAI_BASE_URL" \
     --output-dir "$OUT_DIR" \
     --max-tasks 3 \
+    --no-eval \
     --parallel \
     --max-workers 2 \
     2>&1 | tee "$OUT_DIR/smoke.log"

@@ -14,7 +14,7 @@ async def main():
     sandbox = Sandbox(
         server_url="http://127.0.0.1:18890",
         auto_start_server=True,
-        server_config_path="sandbox/configs/profiles/dev.json"
+        server_config_path="configs/sandbox-server/rag_config.json"
     )
     await sandbox.start()
 
@@ -27,8 +27,8 @@ async def main():
 asyncio.run(main())
 ```
 
-> 注意：`Sandbox` 默认 `server_url` 为 `http://localhost:8080`，如果使用
-> `start_sandbox_server.sh` 启动，请显式设置为 `18890`。
+> 注意：`Sandbox` 默认 `server_url` 为 `http://localhost:18890`，与
+> `start_sandbox_server.sh` 示例配置保持一致。
 
 ### 方式二：手动启动服务器（标准步骤）
 
@@ -45,7 +45,7 @@ asyncio.run(main())
 ```bash
 ./start_sandbox_server.sh --config configs/sandbox-server/web_config.json
 ./start_sandbox_server.sh --config configs/sandbox-server/text2sql_config.json
-./start_sandbox_server.sh --config configs/sandbox-server/vm_config.json
+./start_sandbox_server.sh --config configs/sandbox-server/GUI_config.json
 ```
 
 > 说明：该脚本会从配置文件中的 `server.url` / `server.port` 解析监听地址，
@@ -97,7 +97,7 @@ await sandbox.start()
 - 文档检索/RAG：`configs/sandbox-server/rag_config.json`
 - Web 搜索访问：`configs/sandbox-server/web_config.json`
 - Text2SQL：`configs/sandbox-server/text2sql_config.json`
-- 仅 VM：`configs/sandbox-server/vm_config.json`
+- GUI/VM：`configs/sandbox-server/GUI_config.json`
 
 ### 方式三：连接现有服务器（不使用上下文管理器）
 

@@ -14,7 +14,7 @@ async def main():
     sandbox = Sandbox(
         server_url="http://127.0.0.1:18890",
         auto_start_server=True,
-        server_config_path="sandbox/configs/profiles/dev.json"
+        server_config_path="configs/sandbox-server/rag_config.json"
     )
     await sandbox.start()
 
@@ -27,8 +27,8 @@ async def main():
 asyncio.run(main())
 ```
 
-> Note: `Sandbox` defaults `server_url` to `http://localhost:8080`. If using
-> `start_sandbox_server.sh` to start, explicitly set it to `18890`.
+> Note: `Sandbox` defaults `server_url` to `http://localhost:18890`, matching
+> the example configs used by `start_sandbox_server.sh`.
 
 ### Method 2: Manual Server Startup (Standard)
 
@@ -45,7 +45,7 @@ You can switch to other configs as needed:
 ```bash
 ./start_sandbox_server.sh --config configs/sandbox-server/web_config.json
 ./start_sandbox_server.sh --config configs/sandbox-server/text2sql_config.json
-./start_sandbox_server.sh --config configs/sandbox-server/vm_config.json
+./start_sandbox_server.sh --config configs/sandbox-server/GUI_config.json
 ```
 
 > Note: this script resolves host/port from `server.url` / `server.port` in config,
@@ -97,7 +97,7 @@ Config selection:
 - RAG retrieval: `configs/sandbox-server/rag_config.json`
 - Web search/visit: `configs/sandbox-server/web_config.json`
 - Text2SQL: `configs/sandbox-server/text2sql_config.json`
-- VM only: `configs/sandbox-server/vm_config.json`
+- GUI/VM: `configs/sandbox-server/GUI_config.json`
 
 ### Method 3: Connect to Existing Server (Without Context Manager)
 

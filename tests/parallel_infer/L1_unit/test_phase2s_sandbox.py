@@ -279,6 +279,21 @@ def test_global_backpressure_middleware_rejects_data_plane():
     assert resp.headers["retry-after"] == "1"
 
 
+def test_server_status_exposes_backpressure_snapshot():
+    server = HTTPServiceServer(enable_cors=False)
+    app = server.create_app()
+
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+    resp = client.get("/api/v1/server/status")
+
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["active_sessions"] == 0
+    assert "backpressure" in data
+    assert "global_inflight" in data["backpressure"]
+
+
 # -----------------------------------------------------------------------
 # Commit 2S.3 - per-(worker, resource_type) serial lock in ToolExecutor
 # -----------------------------------------------------------------------

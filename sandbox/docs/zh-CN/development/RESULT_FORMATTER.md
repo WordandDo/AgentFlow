@@ -64,7 +64,7 @@
 from sandbox import HTTPServiceClient
 from sandbox.result_formatter import format_tool_result
 
-async with HTTPServiceClient(base_url="http://localhost:8080") as client:
+async with HTTPServiceClient(base_url="http://127.0.0.1:18890") as client:
     # 执行工具
     response = await client.execute("bash:run", {"command": "ls -la"})
 
